@@ -4093,6 +4093,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-graph",
+ "libc",
  "tempfile",
  "tokio",
 ]

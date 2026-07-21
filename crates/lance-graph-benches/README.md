@@ -12,6 +12,9 @@ cargo bench -p lance-graph-benches
 
 # Run specific benchmark
 cargo bench -p lance-graph-benches --bench graph_execution
+
+# Run the disk-backed graph execution benchmark
+cargo bench -p lance-graph-benches --bench graph_execution_disk
 ```
 
 ## Benchmarks
@@ -21,6 +24,10 @@ cargo bench -p lance-graph-benches --bench graph_execution
   - Single-hop relationship expansion
   - Two-hop relationship expansion
   - Tests with datasets of varying sizes (100, 10K, 1M rows)
+- **graph_execution_disk**: The same query workloads resolved through a
+  directory namespace and executed against Lance datasets on disk. The
+  benchmark reports separate warm-cache and Linux local page-cache cold-start
+  groups.
 
 ## Note
 
