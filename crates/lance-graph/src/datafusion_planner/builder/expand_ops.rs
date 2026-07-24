@@ -24,34 +24,146 @@ impl DataFusionPlanner {
         target_label: &str,
         relationship_types: &[String],
         direction: &RelationshipDirection,
+        relationship_variable: Option<&str>,
         relationship_properties: &HashMap<String, crate::ast::PropertyValue>,
         target_properties: &HashMap<String, crate::ast::PropertyValue>,
     ) -> Result<LogicalPlan> {
         let left_plan = self.build_operator(ctx, input)?;
 
         // Get the unique relationship instance for this expand operation
+        let Some(rel_type) = relationship_types.first() else {
+            return Err(crate::error::GraphError::InvalidPattern {
+                message: "Expand requires at least one relationship type".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        };
         let Some(cat) = &self.catalog else {
             // Fallback: pass-through if catalog not available
-            return Ok(left_plan);
-        };
-
-        let Some(rel_type) = relationship_types.first() else {
+            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+                return Err(crate::error::GraphError::PlanError {
+                    message: format!("CSR index is required for relationship '{}' but no graph catalog is configured", rel_type),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
             return Ok(left_plan);
         };
 
         let rel_instance = ctx.next_relationship_instance(rel_type)?;
         // Use case-insensitive lookups
         let Some(rel_map) = self.config.get_relationship_mapping(rel_type) else {
+            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+                return Err(crate::error::GraphError::PlanError {
+                    message: format!(
+                        "CSR index is required but relationship mapping '{}' is missing",
+                        rel_type
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
             return Ok(left_plan);
         };
 
         let Some(src_label) = ctx.analysis.var_to_label.get(source_variable) else {
+            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+                return Err(crate::error::GraphError::PlanError {
+                    message: format!(
+                        "CSR index is required but source variable '{}' has no label",
+                        source_variable
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
             return Ok(left_plan);
         };
 
         let Some(node_map) = self.config.get_node_mapping(src_label) else {
+            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+                return Err(crate::error::GraphError::PlanError {
+                    message: format!(
+                        "CSR index is required but node mapping '{}' is missing",
+                        src_label
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
             return Ok(left_plan);
         };
+
+        let target_node_map = self.config.get_node_mapping(target_label).ok_or_else(|| {
+            crate::error::GraphError::ConfigError {
+                message: format!("No mapping found for target label: {}", target_label),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            }
+        })?;
+        let source_column =
+            crate::case_insensitive::qualify_column(source_variable, &node_map.id_field);
+        let source_field = left_plan
+            .schema()
+            .field_with_unqualified_name(&source_column)
+            .map_err(|e| self.plan_error("IndexedExpand source ID column is missing", e))?;
+        let source_id_type = source_field.data_type().clone();
+        let target_id_type = cat
+            .node_source(target_label)
+            .and_then(|source| {
+                let schema = source.schema();
+                schema
+                    .field_with_name(&target_node_map.id_field)
+                    .ok()
+                    .map(|field| field.data_type().clone())
+            })
+            .unwrap_or_else(|| source_id_type.clone());
+        let target_reused = left_plan
+            .schema()
+            .field_with_unqualified_name(&crate::case_insensitive::qualify_column(
+                target_variable,
+                &target_node_map.id_field,
+            ))
+            .is_ok();
+        let decision = self.select_expand_index(
+            relationship_types,
+            src_label,
+            target_label,
+            direction,
+            relationship_variable,
+            relationship_properties.is_empty(),
+            &source_id_type,
+            &target_id_type,
+            target_reused,
+        )?;
+        if let crate::index::IndexDecision::Use(index_ref) = decision {
+            let output_target_column = crate::case_insensitive::qualify_column(
+                &rel_instance.alias,
+                &rel_map.target_id_field,
+            );
+            let indexed = crate::datafusion_planner::indexed_expand::IndexedExpandNode::try_new(
+                left_plan,
+                source_column,
+                output_target_column,
+                index_ref,
+                source_id_type,
+                8192,
+            )
+            .map_err(|e| self.plan_error("Failed to build IndexedExpand", e))?;
+            let indexed_plan = datafusion::logical_expr::LogicalPlan::Extension(
+                datafusion::logical_expr::Extension {
+                    node: std::sync::Arc::new(indexed),
+                },
+            );
+            let target_params = TargetJoinParams {
+                target_variable,
+                rel_qualifier: &rel_instance.alias,
+                node_map: target_node_map,
+                rel_map,
+                direction,
+                target_properties,
+            };
+            return self.join_relationship_to_target(
+                LogicalPlanBuilder::from(indexed_plan),
+                cat,
+                ctx,
+                &target_params,
+            );
+        }
 
         let Some(rel_source) = cat.relationship_source(&rel_map.relationship_type) else {
             return Ok(left_plan);
@@ -72,13 +184,6 @@ impl DataFusionPlanner {
         let builder = self.join_source_to_relationship(left_plan, rel_scan, &source_params)?;
 
         // Join relationship with target node using the explicit target_label (case-insensitive)
-        let target_node_map = self.config.get_node_mapping(target_label).ok_or_else(|| {
-            crate::error::GraphError::ConfigError {
-                message: format!("No mapping found for target label: {}", target_label),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            }
-        })?;
-
         let target_params = TargetJoinParams {
             target_variable,
             rel_qualifier: &rel_instance.alias,
@@ -379,6 +484,56 @@ mod tests {
             "plan missing relationship scan: {}",
             s
         );
+    }
+
+    #[test]
+    fn test_df_planner_prefers_csr_index_when_registered() {
+        use crate::index::{
+            CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, InMemoryGraphIndexRegistry,
+            IndexDirection, IndexUsagePolicy,
+        };
+        use arrow_schema::DataType;
+        use std::sync::Arc;
+        let index = crate::CsrIndexBuilder::new()
+            .with_num_vertices(2)
+            .add_edge(0, 1)
+            .try_build()
+            .unwrap();
+        let key = GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing);
+        let registry = Arc::new(InMemoryGraphIndexRegistry::new());
+        registry
+            .register_csr(CsrIndexHandle {
+                index: Arc::new(index),
+                metadata: GraphIndexMetadata {
+                    key,
+                    source_id_field: "id".into(),
+                    target_id_field: "id".into(),
+                    id_data_type: DataType::Int64,
+                    num_vertices: 2,
+                    num_edges: 1,
+                    source_uri: None,
+                    source_version: None,
+                    generation: 1,
+                },
+            })
+            .unwrap();
+        let expand = LogicalOperator::Expand {
+            input: Box::new(person_scan("a")),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            target_label: "Person".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            properties: Default::default(),
+            target_properties: Default::default(),
+        };
+        let planner = DataFusionPlanner::with_catalog(person_knows_config(), make_catalog())
+            .with_indexes(registry, IndexUsagePolicy::Require);
+        let plan = planner.plan(&expand).unwrap();
+        let display = format!("{}", plan.display_indent());
+        assert!(display.contains("IndexedExpand"));
+        assert!(!display.to_lowercase().contains("table scan: knows"));
     }
 
     #[test]

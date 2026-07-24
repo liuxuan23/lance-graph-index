@@ -18,6 +18,7 @@ pub mod analysis;
 mod builder;
 mod config_helpers;
 mod expression;
+pub mod indexed_expand;
 mod join_ops;
 mod scan_ops;
 mod udf;
@@ -31,6 +32,10 @@ pub use analysis::{PlanningContext, QueryAnalysis, RelationshipInstance};
 
 use crate::config::GraphConfig;
 use crate::error::Result;
+use crate::index::{
+    GraphIndexKey, GraphIndexRegistry, IndexDecision, IndexFallbackReason, IndexReference,
+    IndexUsagePolicy,
+};
 use crate::logical_plan::LogicalOperator;
 use datafusion::logical_expr::LogicalPlan;
 use lance_graph_catalog::GraphSourceCatalog;
@@ -45,6 +50,8 @@ pub trait GraphPhysicalPlanner {
 pub struct DataFusionPlanner {
     pub(crate) config: GraphConfig,
     pub(crate) catalog: Option<Arc<dyn GraphSourceCatalog>>,
+    pub(crate) indexes: Option<Arc<dyn GraphIndexRegistry>>,
+    pub(crate) index_policy: IndexUsagePolicy,
 }
 
 impl DataFusionPlanner {
@@ -52,6 +59,8 @@ impl DataFusionPlanner {
         Self {
             config,
             catalog: None,
+            indexes: None,
+            index_policy: IndexUsagePolicy::Disabled,
         }
     }
 
@@ -59,7 +68,98 @@ impl DataFusionPlanner {
         Self {
             config,
             catalog: Some(catalog),
+            indexes: None,
+            index_policy: IndexUsagePolicy::Disabled,
         }
+    }
+
+    pub fn with_indexes(
+        mut self,
+        indexes: Arc<dyn GraphIndexRegistry>,
+        policy: IndexUsagePolicy,
+    ) -> Self {
+        self.indexes = Some(indexes);
+        self.index_policy = policy;
+        self
+    }
+
+    pub fn index_policy(&self) -> IndexUsagePolicy {
+        self.index_policy
+    }
+
+    pub(crate) fn select_expand_index(
+        &self,
+        relationship_types: &[String],
+        source_label: &str,
+        target_label: &str,
+        direction: &crate::ast::RelationshipDirection,
+        relationship_variable: Option<&str>,
+        relationship_properties_empty: bool,
+        source_id_type: &arrow_schema::DataType,
+        target_id_type: &arrow_schema::DataType,
+        target_variable_reused: bool,
+    ) -> Result<IndexDecision> {
+        if self.index_policy == IndexUsagePolicy::Disabled {
+            return Ok(IndexDecision::Fallback(IndexFallbackReason::PolicyDisabled));
+        }
+        let fallback = |reason| -> Result<IndexDecision> {
+            if self.index_policy == IndexUsagePolicy::Require {
+                Err(crate::error::GraphError::PlanError {
+                    message: format!(
+                        "CSR index required but traversal is not eligible: {reason:?}"
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })
+            } else {
+                Ok(IndexDecision::Fallback(reason))
+            }
+        };
+        if relationship_types.len() != 1 {
+            return fallback(IndexFallbackReason::MultipleRelationshipTypes);
+        }
+        if !matches!(direction, crate::ast::RelationshipDirection::Outgoing) {
+            return fallback(IndexFallbackReason::UnsupportedDirection);
+        }
+        if relationship_variable.is_some() {
+            return fallback(IndexFallbackReason::RelationshipVariableUsed);
+        }
+        if !relationship_properties_empty {
+            return fallback(IndexFallbackReason::RelationshipPropertyRequired);
+        }
+        if target_variable_reused {
+            return fallback(IndexFallbackReason::TargetVariableReused);
+        }
+        if !matches!(
+            source_id_type,
+            arrow_schema::DataType::UInt32
+                | arrow_schema::DataType::UInt64
+                | arrow_schema::DataType::Int32
+                | arrow_schema::DataType::Int64
+        ) {
+            return fallback(IndexFallbackReason::UnsupportedIdType);
+        }
+        if source_id_type != target_id_type {
+            return fallback(IndexFallbackReason::SchemaMismatch);
+        }
+        let key = GraphIndexKey::new(
+            &relationship_types[0],
+            source_label,
+            target_label,
+            crate::index::IndexDirection::Outgoing,
+        );
+        let Some(registry) = &self.indexes else {
+            return fallback(IndexFallbackReason::IndexNotFound);
+        };
+        let Some(handle) = registry.get_csr(&key)? else {
+            return fallback(IndexFallbackReason::IndexNotFound);
+        };
+        if handle.metadata.id_data_type != *source_id_type {
+            return fallback(IndexFallbackReason::SchemaMismatch);
+        }
+        Ok(IndexDecision::Use(IndexReference {
+            key,
+            generation: handle.metadata.generation,
+        }))
     }
 
     /// Helper to convert DataFusion builder errors into GraphError::PlanError with context

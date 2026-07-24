@@ -4090,6 +4090,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "criterion",
+ "datafusion",
  "futures",
  "lance",
  "lance-graph",

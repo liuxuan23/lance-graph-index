@@ -17,7 +17,7 @@
 //!
 //! For vertex `v`, its neighbors are `neighbors[offsets[v]..offsets[v+1]]`.
 
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -251,23 +251,10 @@ impl CsrIndexBuilder {
                 location: snafu::Location::new(file!(), line!(), column!()),
             })?;
 
-        let src_array = src_col
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| GraphError::PlanError {
-                message: "src_id column must be UInt64".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
-        let dst_array = dst_col
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| GraphError::PlanError {
-                message: "dst_id column must be UInt64".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
-
         for i in 0..batch.num_rows() {
-            self.edges.push((src_array.value(i), dst_array.value(i)));
+            let src = checked_arrow_id(src_col, i, "src_id")?;
+            let dst = checked_arrow_id(dst_col, i, "dst_id")?;
+            self.edges.push((src, dst));
         }
 
         Ok(self)
@@ -276,21 +263,50 @@ impl CsrIndexBuilder {
     /// Build the CSR index.
     ///
     /// Sorts edges by source vertex, then builds offset and neighbor arrays.
-    pub fn build(mut self) -> CsrIndex {
-        let num_vertices = self.num_vertices.unwrap_or_else(|| {
-            self.edges
-                .iter()
-                .flat_map(|&(s, d)| [s, d])
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0)
-        });
+    pub fn build(self) -> CsrIndex {
+        self.try_build().expect("invalid CSR input")
+    }
+
+    /// Build a validated CSR index. Unlike `build`, this method never silently
+    /// truncates integer IDs or accepts malformed edge data.
+    pub fn try_build(mut self) -> Result<CsrIndex> {
+        let num_vertices = if let Some(n) = self.num_vertices {
+            n
+        } else if let Some(max_id) = self.edges.iter().flat_map(|&(s, d)| [s, d]).max() {
+            max_id.checked_add(1).ok_or_else(|| GraphError::PlanError {
+                message: "maximum vertex ID overflows num_vertices".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+        } else {
+            0
+        };
+
+        let n = usize::try_from(num_vertices).map_err(|_| GraphError::PlanError {
+            message: format!("num_vertices {} does not fit in usize", num_vertices),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+        for &(src, dst) in &self.edges {
+            if src >= num_vertices || dst >= num_vertices {
+                return Err(GraphError::PlanError {
+                    message: format!(
+                        "CSR edge ({src}, {dst}) is outside num_vertices={num_vertices}"
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+        }
 
         // Sort by source vertex for CSR construction
         self.edges.sort_unstable_by_key(|&(src, _)| src);
 
         // Build offset and neighbor arrays
-        let mut offsets = vec![0u64; num_vertices as usize + 1];
+        let mut offsets = vec![
+            0u64;
+            n.checked_add(1).ok_or_else(|| GraphError::PlanError {
+                message: "num_vertices + 1 overflows usize".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+        ];
         let mut neighbors = Vec::with_capacity(self.edges.len());
 
         // Count degrees
@@ -312,12 +328,54 @@ impl CsrIndexBuilder {
             neighbors.push(dst);
         }
 
-        CsrIndex {
+        let index = CsrIndex {
             offsets,
             neighbors,
             num_vertices,
+        };
+        if index.offsets.windows(2).any(|w| w[0] > w[1])
+            || index.offsets.last().copied() != Some(index.neighbors.len() as u64)
+        {
+            return Err(GraphError::PlanError {
+                message: "invalid CSR offsets".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
         }
+        Ok(index)
     }
+}
+
+fn checked_arrow_id(array: &dyn Array, row: usize, name: &str) -> Result<u64> {
+    if array.is_null(row) {
+        return Err(GraphError::PlanError {
+            message: format!("{name} contains null at row {row}"),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    let value = if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        a.value(row) as u64
+    } else if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        a.value(row)
+    } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        i64::from(a.value(row))
+            .try_into()
+            .map_err(|_| ())
+            .map_err(|_| GraphError::PlanError {
+                message: format!("{name} contains a negative ID at row {row}"),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+    } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        a.value(row).try_into().map_err(|_| GraphError::PlanError {
+            message: format!("{name} contains an out-of-range ID at row {row}"),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?
+    } else {
+        return Err(GraphError::PlanError {
+            message: format!("{name} must be UInt32, UInt64, Int32, or Int64"),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    };
+    Ok(value)
 }
 
 impl Default for CsrIndexBuilder {
@@ -439,6 +497,51 @@ mod tests {
         assert_eq!(idx.neighbors(0), &[1, 2]);
         assert_eq!(idx.neighbors(1), &[2]);
         assert_eq!(idx.neighbors(2), &[0]);
+    }
+
+    #[test]
+    fn test_build_from_signed_integer_record_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src_id", DataType::Int64, true),
+            Field::new("dst_id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0), Some(1)])),
+                Arc::new(Int32Array::from(vec![1, 0])),
+            ],
+        )
+        .unwrap();
+        let idx = CsrIndexBuilder::new()
+            .with_num_vertices(2)
+            .add_edges_from_batch(&batch)
+            .unwrap()
+            .try_build()
+            .unwrap();
+        assert_eq!(idx.neighbors(0), &[1]);
+        assert_eq!(idx.neighbors(1), &[0]);
+    }
+
+    #[test]
+    fn test_try_build_rejects_negative_and_out_of_range_ids() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src_id", DataType::Int64, false),
+            Field::new("dst_id", DataType::Int64, false),
+        ]));
+        let negative = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![-1])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        assert!(CsrIndexBuilder::new()
+            .add_edges_from_batch(&negative)
+            .is_err());
+        let out_of_range = CsrIndexBuilder::new().with_num_vertices(1).add_edge(0, 1);
+        assert!(out_of_range.try_build().is_err());
     }
 
     #[test]

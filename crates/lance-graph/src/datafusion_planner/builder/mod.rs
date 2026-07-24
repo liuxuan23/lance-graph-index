@@ -56,6 +56,7 @@ impl DataFusionPlanner {
                 target_label,
                 relationship_types,
                 direction,
+                relationship_variable,
                 properties,
                 target_properties,
                 ..
@@ -67,6 +68,7 @@ impl DataFusionPlanner {
                 target_label,
                 relationship_types,
                 direction,
+                relationship_variable.as_deref(),
                 properties,
                 target_properties,
             ),

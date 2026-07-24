@@ -573,6 +573,51 @@ impl CypherQuery {
         })
     }
 
+    /// Execute with an explicitly registered CSR index. The caller controls the
+    /// index policy; the regular execution API remains unchanged and therefore
+    /// continues to use the relationship-join path.
+    pub async fn execute_with_catalog_context_and_indexes(
+        &self,
+        catalog: Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+        indexes: Arc<dyn crate::index::GraphIndexRegistry>,
+        index_policy: crate::index::IndexUsagePolicy,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        use crate::datafusion_planner::indexed_expand::GraphQueryPlanner;
+        use arrow::compute::concat_batches;
+
+        let (_logical_plan, df_logical_plan) =
+            self.create_logical_plans_with_indexes(catalog, Some(indexes.clone()), index_policy)?;
+        // Install a planner on the supplied context without changing the
+        // context's registered tables or other session configuration.
+        let state_ref = ctx.state_ref();
+        let current_state = state_ref.read().clone();
+        let new_state =
+            datafusion::execution::session_state::SessionStateBuilder::from(current_state)
+                .with_query_planner(Arc::new(GraphQueryPlanner { indexes }))
+                .build();
+        *state_ref.write() = new_state;
+        let df = ctx
+            .execute_logical_plan(df_logical_plan)
+            .await
+            .map_err(|e| GraphError::ExecutionError {
+                message: format!("Failed to execute indexed DataFusion plan: {e}"),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+        let schema = df.schema().inner().clone();
+        let batches = df.collect().await.map_err(|e| GraphError::ExecutionError {
+            message: format!("Failed to collect indexed query results: {e}"),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+        if batches.is_empty() {
+            return Ok(arrow::record_batch::RecordBatch::new_empty(schema));
+        }
+        concat_batches(&batches[0].schema(), &batches).map_err(|e| GraphError::ExecutionError {
+            message: format!("Failed to concatenate indexed results: {e}"),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })
+    }
+
     /// Execute using the DataFusion planner with in-memory datasets
     ///
     /// # Overview
@@ -814,6 +859,22 @@ impl CypherQuery {
         crate::logical_plan::LogicalOperator,
         datafusion::logical_expr::LogicalPlan,
     )> {
+        self.create_logical_plans_with_indexes(
+            catalog,
+            None,
+            crate::index::IndexUsagePolicy::Disabled,
+        )
+    }
+
+    fn create_logical_plans_with_indexes(
+        &self,
+        catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        indexes: Option<Arc<dyn crate::index::GraphIndexRegistry>>,
+        index_policy: crate::index::IndexUsagePolicy,
+    ) -> Result<(
+        crate::logical_plan::LogicalOperator,
+        datafusion::logical_expr::LogicalPlan,
+    )> {
         use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
         use crate::semantic::SemanticAnalyzer;
 
@@ -836,6 +897,11 @@ impl CypherQuery {
 
         // Phase 3: DataFusion Logical Plan
         let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
+        let df_planner = if let Some(indexes) = indexes {
+            df_planner.with_indexes(indexes, index_policy)
+        } else {
+            df_planner
+        };
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
         Ok((logical_plan, df_logical_plan))
@@ -2056,5 +2122,95 @@ mod tests {
                 result
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_csr_index_uses_indexed_expand() {
+        use crate::index::{
+            CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, InMemoryGraphIndexRegistry,
+            IndexDirection, IndexUsagePolicy,
+        };
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::{DefaultTableSource, MemTable};
+        use datafusion::execution::context::SessionContext;
+        use lance_graph_catalog::InMemoryCatalog;
+
+        let node_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let nodes = RecordBatch::try_new(
+            node_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol"])),
+            ],
+        )
+        .unwrap();
+        let rel_schema = Arc::new(Schema::new(vec![
+            Field::new("src_id", DataType::Int64, false),
+            Field::new("dst_id", DataType::Int64, false),
+        ]));
+        let rels = RecordBatch::try_new(
+            rel_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 0])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let node_table = Arc::new(MemTable::try_new(node_schema, vec![vec![nodes]]).unwrap());
+        let rel_table = Arc::new(MemTable::try_new(rel_schema, vec![vec![rels]]).unwrap());
+        ctx.register_table("person", node_table.clone()).unwrap();
+        ctx.register_table("knows", rel_table.clone()).unwrap();
+        let catalog = Arc::new(
+            InMemoryCatalog::new()
+                .with_node_source("Person", Arc::new(DefaultTableSource::new(node_table)))
+                .with_relationship_source("KNOWS", Arc::new(DefaultTableSource::new(rel_table))),
+        );
+        let index = crate::CsrIndexBuilder::new()
+            .with_num_vertices(3)
+            .add_edge(0, 1)
+            .add_edge(0, 2)
+            .try_build()
+            .unwrap();
+        let registry = Arc::new(InMemoryGraphIndexRegistry::new());
+        registry
+            .register_csr(CsrIndexHandle {
+                index: Arc::new(index),
+                metadata: GraphIndexMetadata {
+                    key: GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing),
+                    source_id_field: "id".into(),
+                    target_id_field: "id".into(),
+                    id_data_type: DataType::Int64,
+                    num_vertices: 3,
+                    num_edges: 2,
+                    source_uri: None,
+                    source_version: None,
+                    generation: 1,
+                },
+            })
+            .unwrap();
+        let query = CypherQuery::new("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+            .unwrap()
+            .with_config(
+                GraphConfig::builder()
+                    .with_node_label("Person", "id")
+                    .with_relationship("KNOWS", "src_id", "dst_id")
+                    .build()
+                    .unwrap(),
+            );
+        let output = query
+            .execute_with_catalog_context_and_indexes(
+                catalog,
+                ctx,
+                registry,
+                IndexUsagePolicy::Require,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.num_rows(), 2);
     }
 }
