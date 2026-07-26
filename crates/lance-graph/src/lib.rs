@@ -59,11 +59,12 @@ pub const MAX_VARIABLE_LENGTH_HOPS: u32 = 20;
 
 pub use config::{GraphConfig, NodeMapping, RelationshipMapping};
 pub use csr_index::{build_bidirectional_index, CsrIndex, CsrIndexBuilder};
-pub use error::{GraphError, Result};
+pub use error::{GraphError, GraphIndexErrorKind, Result};
 pub use index::{
-    CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, GraphIndexRegistry,
-    InMemoryGraphIndexRegistry, IndexDirection, IndexFallbackReason, IndexReference,
-    IndexUsagePolicy,
+    CsrIndexHandle, CsrIndexLoadOptions, CsrIndexStore, CsrIndexWriteOptions, GraphIndexKey,
+    GraphIndexMetadata, GraphIndexRegistry, GraphSourceIdentity, InMemoryGraphIndexRegistry,
+    IndexDirection, IndexFallbackReason, IndexReference, IndexSourceValidation, IndexUsagePolicy,
+    PersistedCsrIndexDescriptor, CSR_INDEX_FORMAT_VERSION,
 };
 pub use lance_graph_catalog::{
     DirNamespace, GraphSourceCatalog, InMemoryCatalog, SimpleTableSource,

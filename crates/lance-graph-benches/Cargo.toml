@@ -36,3 +36,8 @@ harness = false
 name = "indexed_expand_star"
 path = "benches/indexed_expand/star.rs"
 harness = false
+
+[[bench]]
+name = "persisted_csr_index"
+path = "benches/indexed_expand/persisted_index.rs"
+harness = false

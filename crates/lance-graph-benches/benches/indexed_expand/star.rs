@@ -6,7 +6,8 @@
 //! Every vertex is a source with the same fan-out, so the relationship table is
 //! much larger than the result of the selective query. The query fixes one hub
 //! and compares scanning/Joining the relationship table with a direct CSR
-//! adjacency lookup.
+//! adjacency lookup. The persisted-loaded case writes and reloads the same CSR
+//! during setup, outside query timing.
 
 use std::sync::Arc;
 
@@ -16,8 +17,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use datafusion::datasource::{DefaultTableSource, MemTable};
 use datafusion::execution::context::SessionContext;
 use lance_graph::{
-    CsrIndexBuilder, CsrIndexHandle, CypherQuery, GraphConfig, GraphIndexKey, GraphIndexMetadata,
-    InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection, IndexUsagePolicy,
+    CsrIndexBuilder, CsrIndexHandle, CsrIndexStore, CypherQuery, GraphConfig, GraphIndexKey,
+    GraphIndexMetadata, InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection,
+    IndexUsagePolicy,
 };
 
 struct StarGraph {
@@ -25,7 +27,10 @@ struct StarGraph {
     catalog: Arc<dyn lance_graph::GraphSourceCatalog>,
     join_context: SessionContext,
     indexed_context: SessionContext,
+    persisted_context: SessionContext,
     indexes: Arc<InMemoryGraphIndexRegistry>,
+    persisted_indexes: Arc<InMemoryGraphIndexRegistry>,
+    _persisted_dir: tempfile::TempDir,
     expected_rows: usize,
 }
 
@@ -70,7 +75,7 @@ fn make_star_edges(source_count: usize, degree: usize) -> RecordBatch {
     .unwrap()
 }
 
-fn setup_graph(source_count: usize, degree: usize) -> StarGraph {
+fn setup_graph(rt: &tokio::runtime::Runtime, source_count: usize, degree: usize) -> StarGraph {
     assert!(
         degree < source_count,
         "star degree must be smaller than the source count"
@@ -91,6 +96,13 @@ fn setup_graph(source_count: usize, degree: usize) -> StarGraph {
         .register_table("person", node_table.clone())
         .unwrap();
     indexed_context
+        .register_table("friend_of", edge_table.clone())
+        .unwrap();
+    let persisted_context = SessionContext::new();
+    persisted_context
+        .register_table("person", node_table.clone())
+        .unwrap();
+    persisted_context
         .register_table("friend_of", edge_table.clone())
         .unwrap();
     let join_context = SessionContext::new();
@@ -115,23 +127,44 @@ fn setup_graph(source_count: usize, degree: usize) -> StarGraph {
         .unwrap()
         .try_build()
         .unwrap();
+    let handle = CsrIndexHandle {
+        index: Arc::new(index),
+        metadata: GraphIndexMetadata {
+            key: GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
+            source_id_field: "person_id".into(),
+            target_id_field: "person_id".into(),
+            id_data_type: DataType::Int64,
+            num_vertices: source_count as u64,
+            num_edges: edges.num_rows() as u64,
+            source_uri: None,
+            source_version: None,
+            generation: 1,
+        },
+    };
     let indexes = Arc::new(InMemoryGraphIndexRegistry::new());
-    indexes
-        .register_csr(CsrIndexHandle {
-            index: Arc::new(index),
-            metadata: GraphIndexMetadata {
-                key: GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
-                source_id_field: "person_id".into(),
-                target_id_field: "person_id".into(),
-                id_data_type: DataType::Int64,
-                num_vertices: source_count as u64,
-                num_edges: edges.num_rows() as u64,
-                source_uri: None,
-                source_version: None,
-                generation: 1,
-            },
-        })
+    indexes.register_csr(handle.clone()).unwrap();
+
+    // Persist and reload before measurement. This registry contains a newly
+    // reconstructed CsrIndex, not the handle used by the in-memory case.
+    let persisted_dir = tempfile::tempdir().unwrap();
+    let index_uri = persisted_dir.path().join("generation-1");
+    let descriptor = rt
+        .block_on(CsrIndexStore::write(
+            index_uri.to_str().unwrap(),
+            &handle,
+            Default::default(),
+        ))
         .unwrap();
+    drop(handle);
+    let persisted_indexes = Arc::new(InMemoryGraphIndexRegistry::new());
+    assert!(rt
+        .block_on(CsrIndexStore::load_into_registry(
+            &descriptor,
+            Default::default(),
+            persisted_indexes.as_ref(),
+            IndexUsagePolicy::Require,
+        ))
+        .unwrap());
 
     let config = GraphConfig::builder()
         .with_node_label("Person", "person_id")
@@ -148,7 +181,10 @@ fn setup_graph(source_count: usize, degree: usize) -> StarGraph {
         catalog,
         join_context,
         indexed_context,
+        persisted_context,
         indexes,
+        persisted_indexes,
+        _persisted_dir: persisted_dir,
         expected_rows: degree,
     }
 }
@@ -176,6 +212,21 @@ fn run_indexed_query(
     .num_rows()
 }
 
+fn run_persisted_query(
+    rt: &tokio::runtime::Runtime,
+    graph: &StarGraph,
+    query: &CypherQuery,
+) -> usize {
+    rt.block_on(query.execute_with_catalog_context_and_indexes(
+        graph.catalog.clone(),
+        graph.persisted_context.clone(),
+        graph.persisted_indexes.clone(),
+        IndexUsagePolicy::Require,
+    ))
+    .unwrap()
+    .num_rows()
+}
+
 fn bench_star_execution(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_execution_star_join_vs_indexed");
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -186,7 +237,7 @@ fn bench_star_execution(c: &mut Criterion) {
         (10_000usize, 10usize),
         (100_000usize, 10usize),
     ] {
-        let graph = setup_graph(source_count, degree);
+        let graph = setup_graph(&rt, source_count, degree);
         let edge_count = source_count * degree;
         group.throughput(Throughput::Elements(degree as u64));
 
@@ -196,6 +247,10 @@ fn bench_star_execution(c: &mut Criterion) {
         );
         assert_eq!(
             run_indexed_query(&rt, &graph, &graph.query_hub),
+            graph.expected_rows
+        );
+        assert_eq!(
+            run_persisted_query(&rt, &graph, &graph.query_hub),
             graph.expected_rows
         );
         group.bench_with_input(
@@ -213,6 +268,14 @@ fn bench_star_execution(c: &mut Criterion) {
             ),
             &(source_count, degree),
             |b, _| b.iter(|| black_box(run_indexed_query(&rt, &graph, &graph.query_hub))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(
+                "persisted_loaded",
+                format!("sources_{source_count}_degree_{degree}_edges_{edge_count}"),
+            ),
+            &(source_count, degree),
+            |b, _| b.iter(|| black_box(run_persisted_query(&rt, &graph, &graph.query_hub))),
         );
     }
     group.finish();

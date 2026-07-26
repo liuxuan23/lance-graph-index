@@ -96,6 +96,60 @@ All queries use the DataFusion planner for optimization and execution.
 
 A builder (`CypherQueryBuilder`) is also available for constructing queries programmatically without parsing text.
 
+## Persisted CSR Indexes
+
+Outgoing CSR indexes can be stored as an immutable generation and loaded into
+the existing in-memory query path after a process restart:
+
+```rust,ignore
+use std::sync::Arc;
+use lance_graph::{
+    CsrIndexLoadOptions, CsrIndexStore, CsrIndexWriteOptions,
+    InMemoryGraphIndexRegistry, IndexUsagePolicy,
+};
+
+// `handle` contains an already-built CsrIndex plus GraphIndexMetadata.
+let descriptor = CsrIndexStore::write(
+    "/data/graph-indexes/knows/generation-7",
+    &handle,
+    CsrIndexWriteOptions::default(),
+).await?;
+
+// A later process can read the descriptor and reconstruct a new CsrIndex.
+let descriptor = CsrIndexStore::read_descriptor(
+    "/data/graph-indexes/knows/generation-7",
+).await?;
+let registry = Arc::new(InMemoryGraphIndexRegistry::new());
+CsrIndexStore::load_into_registry(
+    &descriptor,
+    CsrIndexLoadOptions::default(),
+    registry.as_ref(),
+    IndexUsagePolicy::Require,
+).await?;
+
+let result = query.execute_with_catalog_context_and_indexes(
+    catalog,
+    context,
+    registry,
+    IndexUsagePolicy::Require,
+).await?;
+```
+
+Each generation contains:
+
+```text
+generation-7/
+  manifest.json
+  offsets.lance/
+  neighbors.lance/
+```
+
+The two Lance datasets are written first and `manifest.json` is published last.
+Published generations are immutable. Loading validates the manifest, component
+schemas and versions, CSR offsets and neighbor IDs, optional source URI/version,
+and configured memory limits. The loaded index then resides in memory; query-time
+random access directly against the persisted files is not part of this version.
+
 ## Supported Cypher Surface
 
 - Node patterns `(:Label)` with optional variables.

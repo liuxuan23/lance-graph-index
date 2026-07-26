@@ -7,6 +7,20 @@ use snafu::{prelude::*, Location};
 
 pub type Result<T> = std::result::Result<T, GraphError>;
 
+/// Stable categories for persisted graph-index failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphIndexErrorKind {
+    Missing,
+    Incomplete,
+    Corrupt,
+    Incompatible,
+    Stale,
+    GenerationConflict,
+    MemoryLimitExceeded,
+    AlreadyExists,
+    Io,
+}
+
 /// Errors that can occur during graph query processing
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -30,6 +44,14 @@ pub enum GraphError {
     /// Error during query execution
     #[snafu(display("Query execution error: {message}"))]
     ExecutionError { message: String, location: Location },
+
+    /// Error while persisting or loading a graph index.
+    #[snafu(display("Graph index {kind:?} error: {message}"))]
+    IndexError {
+        kind: GraphIndexErrorKind,
+        message: String,
+        location: Location,
+    },
 
     /// Unsupported Cypher feature
     #[snafu(display("Unsupported Cypher feature: {feature}"))]

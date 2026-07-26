@@ -37,6 +37,65 @@ pub struct CsrIndex {
 }
 
 impl CsrIndex {
+    /// Construct a CSR index from persisted parts while validating all CSR
+    /// invariants. Loaders must use this instead of filling fields directly.
+    pub fn try_from_parts(
+        offsets: Vec<u64>,
+        neighbors: Vec<u64>,
+        num_vertices: u64,
+    ) -> Result<Self> {
+        let n = usize::try_from(num_vertices).map_err(|_| GraphError::PlanError {
+            message: format!("num_vertices {} does not fit in usize", num_vertices),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+        let expected_offsets = n.checked_add(1).ok_or_else(|| GraphError::PlanError {
+            message: "num_vertices + 1 overflows usize".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+        if offsets.len() != expected_offsets {
+            return Err(GraphError::PlanError {
+                message: format!(
+                    "CSR offsets length {} does not equal num_vertices + 1 ({expected_offsets})",
+                    offsets.len()
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        if offsets.first().copied() != Some(0) {
+            return Err(GraphError::PlanError {
+                message: "CSR offsets must start at 0".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        if offsets.windows(2).any(|window| window[0] > window[1]) {
+            return Err(GraphError::PlanError {
+                message: "CSR offsets must be monotonically non-decreasing".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        if offsets.last().copied() != Some(neighbors.len() as u64) {
+            return Err(GraphError::PlanError {
+                message: format!(
+                    "CSR terminal offset {:?} does not equal neighbors length {}",
+                    offsets.last(),
+                    neighbors.len()
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        if let Some(&neighbor) = neighbors.iter().find(|&&neighbor| neighbor >= num_vertices) {
+            return Err(GraphError::PlanError {
+                message: format!("CSR neighbor {neighbor} is outside num_vertices={num_vertices}"),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        Ok(Self {
+            offsets,
+            neighbors,
+            num_vertices,
+        })
+    }
+
     /// Look up all neighbors of a vertex. Returns an empty slice for vertices
     /// with no outgoing edges or vertex IDs beyond the index range.
     pub fn neighbors(&self, vertex_id: u64) -> &[u64] {
@@ -328,20 +387,7 @@ impl CsrIndexBuilder {
             neighbors.push(dst);
         }
 
-        let index = CsrIndex {
-            offsets,
-            neighbors,
-            num_vertices,
-        };
-        if index.offsets.windows(2).any(|w| w[0] > w[1])
-            || index.offsets.last().copied() != Some(index.neighbors.len() as u64)
-        {
-            return Err(GraphError::PlanError {
-                message: "invalid CSR offsets".into(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            });
-        }
-        Ok(index)
+        CsrIndex::try_from_parts(offsets, neighbors, num_vertices)
     }
 }
 
@@ -542,6 +588,19 @@ mod tests {
             .is_err());
         let out_of_range = CsrIndexBuilder::new().with_num_vertices(1).add_edge(0, 1);
         assert!(out_of_range.try_build().is_err());
+    }
+
+    #[test]
+    fn test_try_from_parts_validates_csr_invariants() {
+        let index = CsrIndex::try_from_parts(vec![0, 2, 2], vec![1, 1], 2).unwrap();
+        assert_eq!(index.neighbors(0), &[1, 1]);
+        assert_eq!(index.neighbors(1), &[] as &[u64]);
+
+        assert!(CsrIndex::try_from_parts(vec![1, 1], vec![], 1).is_err());
+        assert!(CsrIndex::try_from_parts(vec![0, 2, 1], vec![0], 2).is_err());
+        assert!(CsrIndex::try_from_parts(vec![0, 2], vec![0], 1).is_err());
+        assert!(CsrIndex::try_from_parts(vec![0, 1], vec![1], 1).is_err());
+        assert!(CsrIndex::try_from_parts(vec![0], vec![], 1).is_err());
     }
 
     #[test]

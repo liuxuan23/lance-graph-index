@@ -21,6 +21,9 @@ cargo bench -p lance-graph-benches --bench graph_index_build
 
 # Run the star-topology Join vs CSR indexed benchmark
 cargo bench -p lance-graph-benches --bench indexed_expand_star
+
+# Run persisted CSR write, warm-load, and local cold-load benchmarks
+cargo bench -p lance-graph-benches --bench persisted_csr_index
 ```
 
 ## Benchmarks
@@ -33,6 +36,7 @@ benches/execution/
   graph_execution_disk.rs
 benches/indexed_expand/
   graph_index_build.rs
+  persisted_index.rs
   star.rs
 ```
 
@@ -56,6 +60,14 @@ benches/indexed_expand/
   setup, outside query timings, and the indexed path uses
   `IndexUsagePolicy::Require` so it cannot silently fall back to the
   relationship-table Join path.
+- **persisted_csr_index**: Separately measures immutable CSR generation writes,
+  warm loads, and Linux local page-cache cold loads from `offsets.lance`,
+  `neighbors.lance`, and `manifest.json`. CSR construction is outside all
+  measurements, and every load uses a fresh registry. The cold group uses
+  `posix_fadvise(..., POSIX_FADV_DONTNEED)` and does not represent remote object
+  store cold starts. The star query benchmark also compares an in-memory index
+  with a separately persisted and reloaded index; persistence and load happen
+  outside query timing.
 
 ## Note
 
