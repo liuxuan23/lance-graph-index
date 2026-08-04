@@ -584,17 +584,27 @@ impl CypherQuery {
         index_policy: crate::index::IndexUsagePolicy,
     ) -> Result<arrow::record_batch::RecordBatch> {
         use crate::datafusion_planner::indexed_expand::GraphQueryPlanner;
+        use crate::node_lookup::discover_lance_node_lookups;
         use arrow::compute::concat_batches;
 
-        let (_logical_plan, df_logical_plan) =
-            self.create_logical_plans_with_indexes(catalog, Some(indexes.clone()), index_policy)?;
+        let node_lookups =
+            discover_lance_node_lookups(self.require_config()?, catalog.clone()).await?;
+        let (_logical_plan, df_logical_plan) = self.create_logical_plans_with_resources(
+            catalog,
+            Some(indexes.clone()),
+            Some(node_lookups.clone()),
+            index_policy,
+        )?;
         // Install a planner on the supplied context without changing the
         // context's registered tables or other session configuration.
         let state_ref = ctx.state_ref();
         let current_state = state_ref.read().clone();
         let new_state =
             datafusion::execution::session_state::SessionStateBuilder::from(current_state)
-                .with_query_planner(Arc::new(GraphQueryPlanner { indexes }))
+                .with_query_planner(Arc::new(GraphQueryPlanner {
+                    indexes,
+                    node_lookups,
+                }))
                 .build();
         *state_ref.write() = new_state;
         let df = ctx
@@ -616,6 +626,53 @@ impl CypherQuery {
             message: format!("Failed to concatenate indexed results: {e}"),
             location: snafu::Location::new(file!(), line!(), column!()),
         })
+    }
+
+    /// Explain an indexed query using the same CSR and node-lookup resources
+    /// that will be used by [`Self::execute_with_catalog_context_and_indexes`].
+    pub async fn explain_with_catalog_context_and_indexes(
+        &self,
+        catalog: Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+        indexes: Arc<dyn crate::index::GraphIndexRegistry>,
+        index_policy: crate::index::IndexUsagePolicy,
+    ) -> Result<String> {
+        use crate::datafusion_planner::indexed_expand::GraphQueryPlanner;
+        use crate::node_lookup::discover_lance_node_lookups;
+
+        let node_lookups =
+            discover_lance_node_lookups(self.require_config()?, catalog.clone()).await?;
+        let (logical_plan, df_logical_plan) = self.create_logical_plans_with_resources(
+            catalog,
+            Some(indexes.clone()),
+            Some(node_lookups.clone()),
+            index_policy,
+        )?;
+        let state_ref = ctx.state_ref();
+        let current_state = state_ref.read().clone();
+        let new_state =
+            datafusion::execution::session_state::SessionStateBuilder::from(current_state)
+                .with_query_planner(Arc::new(GraphQueryPlanner {
+                    indexes,
+                    node_lookups,
+                }))
+                .build();
+        *state_ref.write() = new_state;
+        let df = ctx
+            .execute_logical_plan(df_logical_plan.clone())
+            .await
+            .map_err(|e| GraphError::ExecutionError {
+                message: format!("Failed to prepare indexed DataFusion plan: {e}"),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+        let physical_plan =
+            df.create_physical_plan()
+                .await
+                .map_err(|e| GraphError::ExecutionError {
+                    message: format!("Failed to create indexed physical plan: {e}"),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+        self.format_explain_output(&logical_plan, &df_logical_plan, physical_plan.as_ref())
     }
 
     /// Execute using the DataFusion planner with in-memory datasets
@@ -875,6 +932,19 @@ impl CypherQuery {
         crate::logical_plan::LogicalOperator,
         datafusion::logical_expr::LogicalPlan,
     )> {
+        self.create_logical_plans_with_resources(catalog, indexes, None, index_policy)
+    }
+
+    fn create_logical_plans_with_resources(
+        &self,
+        catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        indexes: Option<Arc<dyn crate::index::GraphIndexRegistry>>,
+        node_lookups: Option<Arc<dyn crate::node_lookup::NodeLookupRegistry>>,
+        index_policy: crate::index::IndexUsagePolicy,
+    ) -> Result<(
+        crate::logical_plan::LogicalOperator,
+        datafusion::logical_expr::LogicalPlan,
+    )> {
         use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
         use crate::semantic::SemanticAnalyzer;
 
@@ -897,11 +967,14 @@ impl CypherQuery {
 
         // Phase 3: DataFusion Logical Plan
         let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
-        let df_planner = if let Some(indexes) = indexes {
+        let mut df_planner = if let Some(indexes) = indexes {
             df_planner.with_indexes(indexes, index_policy)
         } else {
             df_planner
         };
+        if let Some(node_lookups) = node_lookups {
+            df_planner = df_planner.with_node_lookups(node_lookups);
+        }
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
         Ok((logical_plan, df_logical_plan))

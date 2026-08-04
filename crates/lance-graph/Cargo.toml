@@ -33,6 +33,7 @@ futures = "0.3"
 lance-graph-catalog = { path = "../lance-graph-catalog", version = "0.5.4" }
 lance = "1.0.0"
 lance-io = "1.0.0"
+lance-index = "1.0.0"
 lance-linalg = "1.0.0"
 lance-namespace = "1.0.1"
 nom = "7.1"

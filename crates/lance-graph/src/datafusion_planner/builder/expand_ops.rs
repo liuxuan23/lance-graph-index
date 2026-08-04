@@ -6,7 +6,7 @@
 use crate::ast::RelationshipDirection;
 use crate::datafusion_planner::analysis::PlanningContext;
 use crate::datafusion_planner::join_ops::{SourceJoinParams, TargetJoinParams};
-use crate::datafusion_planner::DataFusionPlanner;
+use crate::datafusion_planner::{DataFusionPlanner, TargetAccessDecision};
 use crate::error::Result;
 use crate::logical_plan::*;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
@@ -138,7 +138,7 @@ impl DataFusionPlanner {
             let indexed = crate::datafusion_planner::indexed_expand::IndexedExpandNode::try_new(
                 left_plan,
                 source_column,
-                output_target_column,
+                output_target_column.clone(),
                 index_ref,
                 source_id_type,
                 8192,
@@ -149,6 +149,50 @@ impl DataFusionPlanner {
                     node: std::sync::Arc::new(indexed),
                 },
             );
+            if let TargetAccessDecision::GetV(lookup_ref) = self.select_target_access(
+                target_label,
+                &target_node_map.id_field,
+                &target_id_type,
+                target_reused,
+            )? {
+                let registry = self.node_lookups.as_ref().ok_or_else(|| {
+                    self.plan_error(
+                        "Failed to build GetV",
+                        "node lookup registry disappeared during planning",
+                    )
+                })?;
+                let handle = registry.get(&lookup_ref.key)?.ok_or_else(|| {
+                    self.plan_error(
+                        "Failed to build GetV",
+                        "node lookup handle disappeared during planning",
+                    )
+                })?;
+                let target_arrow_schema: arrow_schema::Schema = handle.dataset.schema().into();
+                let target_predicates = target_properties
+                    .iter()
+                    .map(|(field, value)| {
+                        col(field).eq(super::super::expression::to_df_value_expr(
+                            &crate::ast::ValueExpression::Literal(value.clone()),
+                        ))
+                    })
+                    .collect();
+                let get_v = crate::datafusion_planner::get_v::GetVNode::try_new(
+                    indexed_plan,
+                    target_variable,
+                    output_target_column,
+                    &target_node_map.id_field,
+                    lookup_ref,
+                    std::sync::Arc::new(target_arrow_schema),
+                    target_predicates,
+                    8192,
+                )
+                .map_err(|e| self.plan_error("Failed to build GetV", e))?;
+                return Ok(datafusion::logical_expr::LogicalPlan::Extension(
+                    datafusion::logical_expr::Extension {
+                        node: std::sync::Arc::new(get_v),
+                    },
+                ));
+            }
             let target_params = TargetJoinParams {
                 target_variable,
                 rel_qualifier: &rel_instance.alias,

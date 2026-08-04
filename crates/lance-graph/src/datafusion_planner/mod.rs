@@ -18,6 +18,7 @@ pub mod analysis;
 mod builder;
 mod config_helpers;
 mod expression;
+pub mod get_v;
 pub mod indexed_expand;
 mod join_ops;
 mod scan_ops;
@@ -37,6 +38,7 @@ use crate::index::{
     IndexUsagePolicy,
 };
 use crate::logical_plan::LogicalOperator;
+use crate::node_lookup::{NodeLookupKey, NodeLookupReference, NodeLookupRegistry};
 use datafusion::logical_expr::LogicalPlan;
 use lance_graph_catalog::GraphSourceCatalog;
 use std::sync::Arc;
@@ -51,7 +53,25 @@ pub struct DataFusionPlanner {
     pub(crate) config: GraphConfig,
     pub(crate) catalog: Option<Arc<dyn GraphSourceCatalog>>,
     pub(crate) indexes: Option<Arc<dyn GraphIndexRegistry>>,
+    pub(crate) node_lookups: Option<Arc<dyn NodeLookupRegistry>>,
     pub(crate) index_policy: IndexUsagePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetAccessFallbackReason {
+    NodeLookupRegistryMissing,
+    TargetProviderNotLance,
+    TargetScalarIndexNotFound,
+    TargetIdTypeMismatch,
+    TargetVariableReused,
+    UnsupportedTargetPredicate,
+    StaleTargetDataset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetAccessDecision {
+    GetV(NodeLookupReference),
+    Join(TargetAccessFallbackReason),
 }
 
 impl DataFusionPlanner {
@@ -60,6 +80,7 @@ impl DataFusionPlanner {
             config,
             catalog: None,
             indexes: None,
+            node_lookups: None,
             index_policy: IndexUsagePolicy::Disabled,
         }
     }
@@ -69,6 +90,7 @@ impl DataFusionPlanner {
             config,
             catalog: Some(catalog),
             indexes: None,
+            node_lookups: None,
             index_policy: IndexUsagePolicy::Disabled,
         }
     }
@@ -80,6 +102,11 @@ impl DataFusionPlanner {
     ) -> Self {
         self.indexes = Some(indexes);
         self.index_policy = policy;
+        self
+    }
+
+    pub fn with_node_lookups(mut self, node_lookups: Arc<dyn NodeLookupRegistry>) -> Self {
+        self.node_lookups = Some(node_lookups);
         self
     }
 
@@ -160,6 +187,42 @@ impl DataFusionPlanner {
             key,
             generation: handle.metadata.generation,
         }))
+    }
+
+    pub(crate) fn select_target_access(
+        &self,
+        target_label: &str,
+        target_id_field: &str,
+        target_id_type: &arrow_schema::DataType,
+        target_variable_reused: bool,
+    ) -> Result<TargetAccessDecision> {
+        if target_variable_reused {
+            return Ok(TargetAccessDecision::Join(
+                TargetAccessFallbackReason::TargetVariableReused,
+            ));
+        }
+        let Some(registry) = &self.node_lookups else {
+            return Ok(TargetAccessDecision::Join(
+                TargetAccessFallbackReason::NodeLookupRegistryMissing,
+            ));
+        };
+        let key = NodeLookupKey::new(target_label, target_id_field);
+        let Some(handle) = registry.get(&key)? else {
+            return Ok(TargetAccessDecision::Join(
+                TargetAccessFallbackReason::TargetScalarIndexNotFound,
+            ));
+        };
+        if &handle.metadata.id_data_type != target_id_type {
+            return Ok(TargetAccessDecision::Join(
+                TargetAccessFallbackReason::TargetIdTypeMismatch,
+            ));
+        }
+        if handle.dataset.version().version != handle.metadata.dataset_version {
+            return Ok(TargetAccessDecision::Join(
+                TargetAccessFallbackReason::StaleTargetDataset,
+            ));
+        }
+        Ok(TargetAccessDecision::GetV(handle.reference()))
     }
 
     /// Helper to convert DataFusion builder errors into GraphError::PlanError with context

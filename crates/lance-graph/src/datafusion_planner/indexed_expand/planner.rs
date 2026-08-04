@@ -1,5 +1,7 @@
 use super::{IndexedExpandExec, IndexedExpandNode};
+use crate::datafusion_planner::get_v::GetVExtensionPlanner;
 use crate::index::GraphIndexRegistry;
+use crate::node_lookup::NodeLookupRegistry;
 use async_trait::async_trait;
 use datafusion::common::Result;
 use datafusion::execution::context::SessionState;
@@ -66,6 +68,7 @@ impl ExtensionPlanner for IndexedExpandExtensionPlanner {
 
 pub struct GraphQueryPlanner {
     pub indexes: Arc<dyn GraphIndexRegistry>,
+    pub node_lookups: Arc<dyn NodeLookupRegistry>,
 }
 impl fmt::Debug for GraphQueryPlanner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -79,11 +82,14 @@ impl datafusion::execution::context::QueryPlanner for GraphQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-            IndexedExpandExtensionPlanner {
+        DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(IndexedExpandExtensionPlanner {
                 indexes: self.indexes.clone(),
-            },
-        )])
+            }),
+            Arc::new(GetVExtensionPlanner {
+                node_lookups: self.node_lookups.clone(),
+            }),
+        ])
         .create_physical_plan(logical_plan, session_state)
         .await
     }

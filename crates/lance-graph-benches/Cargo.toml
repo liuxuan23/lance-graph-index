@@ -6,8 +6,10 @@ publish = false
 description = "Benchmarks for lance-graph (not published)"
 
 [dependencies]
+async-trait = "0.1"
 lance-graph = { path = "../lance-graph", version = "0.5.3" }
 lance = "1.0.0"
+lance-index = "1.0.0"
 arrow-array = "56.2"
 arrow-schema = "56.2"
 criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
@@ -35,6 +37,11 @@ harness = false
 [[bench]]
 name = "indexed_expand_star"
 path = "benches/indexed_expand/star.rs"
+harness = false
+
+[[bench]]
+name = "indexed_expand_target_join"
+path = "benches/indexed_expand/target_join_cost.rs"
 harness = false
 
 [[bench]]
