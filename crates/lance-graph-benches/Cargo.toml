@@ -48,3 +48,13 @@ harness = false
 name = "persisted_csr_index"
 path = "benches/indexed_expand/persisted_index.rs"
 harness = false
+
+[[bench]]
+name = "direct_adjacency_index"
+path = "benches/indexed_expand/direct_adjacency.rs"
+harness = false
+
+[[bench]]
+name = "multi_type_direct_adjacency"
+path = "benches/indexed_expand/multi_type_direct_adjacency.rs"
+harness = false

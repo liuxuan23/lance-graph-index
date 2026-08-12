@@ -1,4 +1,4 @@
-use crate::index::IndexReference;
+use crate::index::ExpandIndexReference;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::{DFSchema, DFSchemaRef, Result as DFResult};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
@@ -6,22 +6,22 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct IndexedExpandNode {
+pub struct AdjacencyExpandNode {
     input: LogicalPlan,
     source_column: String,
     output_target_column: String,
-    index_ref: IndexReference,
+    index_ref: ExpandIndexReference,
     output_id_type: DataType,
     schema: DFSchemaRef,
     max_output_batch_rows: usize,
 }
 
-impl IndexedExpandNode {
+impl AdjacencyExpandNode {
     pub fn try_new(
         input: LogicalPlan,
         source_column: impl Into<String>,
         output_target_column: impl Into<String>,
-        index_ref: IndexReference,
+        index_ref: ExpandIndexReference,
         output_id_type: DataType,
         max_output_batch_rows: usize,
     ) -> DFResult<Self> {
@@ -33,7 +33,7 @@ impl IndexedExpandNode {
             .is_err()
         {
             return Err(datafusion::common::DataFusionError::Plan(format!(
-                "IndexedExpand source column '{}' is missing",
+                "AdjacencyExpand source column '{}' is missing",
                 source_column
             )));
         }
@@ -43,13 +43,13 @@ impl IndexedExpandNode {
             .is_ok()
         {
             return Err(datafusion::common::DataFusionError::Plan(format!(
-                "IndexedExpand output column '{}' collides with input",
+                "AdjacencyExpand output column '{}' collides with input",
                 output_target_column
             )));
         }
         if max_output_batch_rows == 0 {
             return Err(datafusion::common::DataFusionError::Plan(
-                "IndexedExpand batch size must be greater than zero".into(),
+                "AdjacencyExpand batch size must be greater than zero".into(),
             ));
         }
         let mut fields = input.schema().as_arrow().fields().to_vec();
@@ -78,7 +78,7 @@ impl IndexedExpandNode {
     pub fn output_target_column(&self) -> &str {
         &self.output_target_column
     }
-    pub fn index_ref(&self) -> &IndexReference {
+    pub fn index_ref(&self) -> &ExpandIndexReference {
         &self.index_ref
     }
     pub fn output_id_type(&self) -> &DataType {
@@ -89,7 +89,7 @@ impl IndexedExpandNode {
     }
 }
 
-impl PartialOrd for IndexedExpandNode {
+impl PartialOrd for AdjacencyExpandNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(
             (
@@ -110,9 +110,9 @@ impl PartialOrd for IndexedExpandNode {
     }
 }
 
-impl UserDefinedLogicalNodeCore for IndexedExpandNode {
+impl UserDefinedLogicalNodeCore for AdjacencyExpandNode {
     fn name(&self) -> &str {
-        "IndexedExpand"
+        "AdjacencyExpand"
     }
     fn inputs(&self) -> Vec<&LogicalPlan> {
         vec![&self.input]
@@ -124,7 +124,7 @@ impl UserDefinedLogicalNodeCore for IndexedExpandNode {
         vec![]
     }
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IndexedExpand: relationship_type={}, direction={:?}, source={}, target={}, index_generation={}", self.index_ref.key.relationship_type, self.index_ref.key.direction, self.source_column, self.output_target_column, self.index_ref.generation)
+        write!(f, "AdjacencyExpand: relationship_type={}, direction={:?}, source={}, target={}, index={:?}", self.index_ref_key().relationship_type, self.index_ref_key().direction, self.source_column, self.output_target_column, self.index_ref)
     }
     fn with_exprs_and_inputs(
         &self,
@@ -133,7 +133,7 @@ impl UserDefinedLogicalNodeCore for IndexedExpandNode {
     ) -> DFResult<Self> {
         if inputs.len() != 1 {
             return Err(datafusion::common::DataFusionError::Plan(
-                "IndexedExpand expects one input".into(),
+                "AdjacencyExpand expects one input".into(),
             ));
         }
         Self::try_new(
@@ -144,5 +144,14 @@ impl UserDefinedLogicalNodeCore for IndexedExpandNode {
             self.output_id_type.clone(),
             self.max_output_batch_rows,
         )
+    }
+}
+
+impl AdjacencyExpandNode {
+    fn index_ref_key(&self) -> &crate::index::GraphIndexKey {
+        match &self.index_ref {
+            ExpandIndexReference::Csr(reference) => &reference.key,
+            ExpandIndexReference::DirectAdjacency(reference) => &reference.key,
+        }
     }
 }

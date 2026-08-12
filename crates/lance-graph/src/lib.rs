@@ -62,10 +62,18 @@ pub use config::{GraphConfig, NodeMapping, RelationshipMapping};
 pub use csr_index::{build_bidirectional_index, CsrIndex, CsrIndexBuilder};
 pub use error::{GraphError, GraphIndexErrorKind, Result};
 pub use index::{
-    CsrIndexHandle, CsrIndexLoadOptions, CsrIndexStore, CsrIndexWriteOptions, GraphIndexKey,
-    GraphIndexMetadata, GraphIndexRegistry, GraphSourceIdentity, InMemoryGraphIndexRegistry,
-    IndexDirection, IndexFallbackReason, IndexReference, IndexSourceValidation, IndexUsagePolicy,
-    PersistedCsrIndexDescriptor, CSR_INDEX_FORMAT_VERSION,
+    CsrIndexHandle, CsrIndexLoadOptions, CsrIndexStore, CsrIndexWriteOptions,
+    DirectAdjacencyIndexBuilder, DirectAdjacencyIndexHandle, DirectAdjacencyIndexStore,
+    DirectAdjacencyLoadOptions, DirectAdjacencyMetadata, DirectAdjacencyReference,
+    DirectAdjacencyWriteOptions, ExpandExecutionMode, ExpandIndexReference, ExpandPlanDecision,
+    GraphIndexKey, GraphIndexMetadata, GraphIndexRegistry, GraphSourceIdentity,
+    InMemoryGraphIndexRegistry, IndexDirection, IndexReference, IndexSourceValidation,
+    MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexHandle,
+    MultiTypeDirectAdjacencyIndexStore, MultiTypeDirectAdjacencyLoadOptions,
+    MultiTypeDirectAdjacencyMetadata, MultiTypeSourceValidation, PersistedCsrIndexDescriptor,
+    PersistedDirectAdjacencyDescriptor, PersistedMultiTypeDirectAdjacencyDescriptor,
+    CSR_INDEX_FORMAT_VERSION, DIRECT_ADJACENCY_INDEX_FORMAT_VERSION,
+    MULTI_TYPE_DIRECT_ADJACENCY_INDEX_FORMAT_VERSION,
 };
 pub use lance_graph_catalog::{
     DirNamespace, GraphSourceCatalog, InMemoryCatalog, SimpleTableSource,

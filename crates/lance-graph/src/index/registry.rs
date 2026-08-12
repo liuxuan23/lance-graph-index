@@ -1,15 +1,27 @@
-use super::metadata::{CsrIndexHandle, GraphIndexKey};
+use super::metadata::{
+    CsrIndexHandle, DirectAdjacencyIndexHandle, GraphIndexKey, MultiTypeDirectAdjacencyIndexHandle,
+};
 use crate::error::{GraphError, GraphIndexErrorKind, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub trait GraphIndexRegistry: Send + Sync {
     fn get_csr(&self, key: &GraphIndexKey) -> Result<Option<Arc<CsrIndexHandle>>>;
+    fn get_direct_adjacency(
+        &self,
+        index_name: &str,
+        key: &GraphIndexKey,
+    ) -> Result<Option<Arc<DirectAdjacencyIndexHandle>>>;
+    fn get_direct_adjacency_bundle(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeDirectAdjacencyIndexHandle>>>;
 }
 
 #[derive(Debug, Default)]
 pub struct InMemoryGraphIndexRegistry {
-    indexes: RwLock<HashMap<GraphIndexKey, Arc<CsrIndexHandle>>>,
+    csr_indexes: RwLock<HashMap<GraphIndexKey, Arc<CsrIndexHandle>>>,
+    direct_adjacency_indexes: RwLock<HashMap<String, Arc<MultiTypeDirectAdjacencyIndexHandle>>>,
 }
 
 impl InMemoryGraphIndexRegistry {
@@ -25,10 +37,13 @@ impl InMemoryGraphIndexRegistry {
                 location: snafu::Location::new(file!(), line!(), column!()),
             });
         }
-        let mut indexes = self.indexes.write().map_err(|_| GraphError::PlanError {
-            message: "index registry lock poisoned".into(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        let mut indexes = self
+            .csr_indexes
+            .write()
+            .map_err(|_| GraphError::PlanError {
+                message: "index registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
         if let Some(previous) = indexes.get(&handle.metadata.key) {
             if handle.metadata.generation <= previous.metadata.generation {
                 handle.metadata.generation = previous.metadata.generation.saturating_add(1);
@@ -50,10 +65,13 @@ impl InMemoryGraphIndexRegistry {
                 location: snafu::Location::new(file!(), line!(), column!()),
             });
         }
-        let mut indexes = self.indexes.write().map_err(|_| GraphError::PlanError {
-            message: "index registry lock poisoned".into(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        let mut indexes = self
+            .csr_indexes
+            .write()
+            .map_err(|_| GraphError::PlanError {
+                message: "index registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
         if let Some(previous) = indexes.get(&handle.metadata.key) {
             if handle.metadata.generation < previous.metadata.generation {
                 return Err(GraphError::IndexError {
@@ -82,9 +100,67 @@ impl InMemoryGraphIndexRegistry {
         indexes.insert(handle.metadata.key.clone(), Arc::new(handle));
         Ok(())
     }
+
+    pub fn register_direct_adjacency_bundle(
+        &self,
+        handle: MultiTypeDirectAdjacencyIndexHandle,
+    ) -> Result<()> {
+        validate_direct_adjacency_bundle(&handle)?;
+        let mut indexes =
+            self.direct_adjacency_indexes
+                .write()
+                .map_err(|_| GraphError::PlanError {
+                    message: "direct adjacency registry lock poisoned".into(),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+        let index_name = normalize_index_name(&handle.metadata.index_name)?;
+        if let Some(previous) = indexes.get(&index_name) {
+            if handle.metadata.bundle_generation < previous.metadata.bundle_generation {
+                return Err(GraphError::IndexError {
+                    kind: GraphIndexErrorKind::GenerationConflict,
+                    message: format!(
+                        "direct adjacency bundle generation {} is older than registered generation {} for {}",
+                        handle.metadata.bundle_generation,
+                        previous.metadata.bundle_generation,
+                        index_name,
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+            if handle.metadata.bundle_generation == previous.metadata.bundle_generation {
+                if bundle_identity_matches(&handle, previous) {
+                    return Ok(());
+                }
+                return Err(GraphError::IndexError {
+                    kind: GraphIndexErrorKind::GenerationConflict,
+                    message: format!(
+                        "direct adjacency bundle generation {} conflicts with registered bundle {}",
+                        handle.metadata.bundle_generation, index_name
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+        }
+        indexes.insert(index_name, Arc::new(handle));
+        Ok(())
+    }
+
+    pub fn remove_direct_adjacency(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeDirectAdjacencyIndexHandle>>> {
+        Ok(self
+            .direct_adjacency_indexes
+            .write()
+            .map_err(|_| GraphError::PlanError {
+                message: "direct adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .remove(&normalize_index_name(index_name)?))
+    }
     pub fn remove(&self, key: &GraphIndexKey) -> Result<Option<Arc<CsrIndexHandle>>> {
         Ok(self
-            .indexes
+            .csr_indexes
             .write()
             .map_err(|_| GraphError::PlanError {
                 message: "index registry lock poisoned".into(),
@@ -93,10 +169,120 @@ impl InMemoryGraphIndexRegistry {
             .remove(key))
     }
 }
+
+fn validate_direct_adjacency_bundle(handle: &MultiTypeDirectAdjacencyIndexHandle) -> Result<()> {
+    let index_name = normalize_index_name(&handle.metadata.index_name)?;
+    if index_name != handle.metadata.index_name {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Incompatible,
+            message: "direct adjacency bundle name must be normalized".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    if handle.components.is_empty()
+        || handle.metadata.num_components != handle.components.len() as u64
+    {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Corrupt,
+            message: "direct adjacency bundle component count mismatch".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    let mut num_sources = 0_u64;
+    let mut num_edges = 0_u64;
+    for (key, component) in &handle.components {
+        if key != &component.metadata.key {
+            return Err(GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "direct adjacency bundle component key mismatch".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        validate_direct_adjacency_handle(component)?;
+        num_sources = num_sources
+            .checked_add(component.metadata.num_sources)
+            .ok_or_else(|| GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "direct adjacency bundle source count overflow".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+        num_edges = num_edges
+            .checked_add(component.metadata.num_edges)
+            .ok_or_else(|| GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "direct adjacency bundle edge count overflow".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+    }
+    if handle.metadata.num_sources != num_sources || handle.metadata.num_edges != num_edges {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Corrupt,
+            message: "direct adjacency bundle aggregate counts mismatch".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    Ok(())
+}
+
+fn validate_direct_adjacency_handle(handle: &DirectAdjacencyIndexHandle) -> Result<()> {
+    if handle.metadata.dataset_version != handle.dataset.version().version {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Stale,
+            message: format!(
+                "direct adjacency dataset version {} does not match metadata version {}",
+                handle.dataset.version().version,
+                handle.metadata.dataset_version
+            ),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    if handle.metadata.source_version.is_some() && handle.metadata.source_uri.is_none() {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Incompatible,
+            message: "direct adjacency source_version requires source_uri".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    if handle.metadata.source_id_field.is_empty() || handle.metadata.adjacency_field.is_empty() {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Incompatible,
+            message: "direct adjacency field names must not be empty".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_index_name(index_name: &str) -> Result<String> {
+    let normalized = index_name.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Incompatible,
+            message: "direct adjacency index name must not be empty".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    Ok(normalized)
+}
+
+fn bundle_identity_matches(
+    left: &MultiTypeDirectAdjacencyIndexHandle,
+    right: &MultiTypeDirectAdjacencyIndexHandle,
+) -> bool {
+    left.metadata == right.metadata
+        && left.components.len() == right.components.len()
+        && left.components.iter().all(|(key, component)| {
+            right.components.get(key).is_some_and(|other| {
+                component.metadata == other.metadata
+                    && component.dataset.version().version == other.dataset.version().version
+            })
+        })
+}
+
 impl GraphIndexRegistry for InMemoryGraphIndexRegistry {
     fn get_csr(&self, key: &GraphIndexKey) -> Result<Option<Arc<CsrIndexHandle>>> {
         Ok(self
-            .indexes
+            .csr_indexes
             .read()
             .map_err(|_| GraphError::PlanError {
                 message: "index registry lock poisoned".into(),
@@ -105,14 +291,51 @@ impl GraphIndexRegistry for InMemoryGraphIndexRegistry {
             .get(key)
             .cloned())
     }
+
+    fn get_direct_adjacency(
+        &self,
+        index_name: &str,
+        key: &GraphIndexKey,
+    ) -> Result<Option<Arc<DirectAdjacencyIndexHandle>>> {
+        let index_name = normalize_index_name(index_name)?;
+        Ok(self
+            .direct_adjacency_indexes
+            .read()
+            .map_err(|_| GraphError::PlanError {
+                message: "direct adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .get(&index_name)
+            .and_then(|bundle| bundle.get(key)))
+    }
+
+    fn get_direct_adjacency_bundle(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeDirectAdjacencyIndexHandle>>> {
+        Ok(self
+            .direct_adjacency_indexes
+            .read()
+            .map_err(|_| GraphError::PlanError {
+                message: "direct adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .get(&normalize_index_name(index_name)?)
+            .cloned())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{GraphIndexKey, GraphIndexMetadata, IndexDirection};
+    use crate::index::{
+        DirectAdjacencyIndexBuilder, DirectAdjacencyMetadata, GraphIndexKey, GraphIndexMetadata,
+        IndexDirection, MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexStore,
+    };
     use crate::CsrIndexBuilder;
+    use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::DataType;
+    use arrow_schema::{Field, Schema};
 
     #[test]
     fn register_and_lookup_is_case_insensitive() {
@@ -177,6 +400,110 @@ mod tests {
         registry.register_loaded_csr(make_handle(7)).unwrap();
         registry.register_loaded_csr(make_handle(8)).unwrap();
         let error = registry.register_loaded_csr(make_handle(6)).unwrap_err();
+        assert!(matches!(
+            error,
+            GraphError::IndexError {
+                kind: GraphIndexErrorKind::GenerationConflict,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_direct_bundles_are_isolated_and_replace_atomically() {
+        async fn bundle(
+            root: &std::path::Path,
+            name: &str,
+            bundle_generation: u64,
+            component_generation: u64,
+        ) -> MultiTypeDirectAdjacencyIndexHandle {
+            let component_uri = root.join(format!("{name}-component-{bundle_generation}"));
+            let bundle_uri = root.join(format!("{name}-bundle-{bundle_generation}"));
+            let edges = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("src_id", DataType::Int64, false),
+                    Field::new("dst_id", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![2])),
+                ],
+            )
+            .unwrap();
+            let descriptor = DirectAdjacencyIndexBuilder::new(DirectAdjacencyMetadata {
+                key: GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing),
+                source_id_field: "src_id".into(),
+                target_id_field: "person_id".into(),
+                adjacency_field: "dst_ids".into(),
+                id_data_type: DataType::Int64,
+                num_sources: 0,
+                num_edges: 0,
+                dataset_uri: String::new(),
+                dataset_version: 0,
+                scalar_index_name: format!("{name}_src_btree"),
+                source_uri: None,
+                source_version: None,
+                generation: component_generation,
+            })
+            .unwrap()
+            .add_edges_from_batch(&edges)
+            .unwrap()
+            .build_and_persist(component_uri.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+            let bundle = MultiTypeDirectAdjacencyIndexBuilder::new(name, bundle_generation)
+                .unwrap()
+                .add_component(descriptor)
+                .unwrap()
+                .build_and_persist(bundle_uri.to_str().unwrap())
+                .await
+                .unwrap();
+            MultiTypeDirectAdjacencyIndexStore::load(&bundle, Default::default())
+                .await
+                .unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = InMemoryGraphIndexRegistry::new();
+        let first = bundle(directory.path(), "primary", 1, 1).await;
+        let old_component = first.get(&GraphIndexKey::new(
+            "KNOWS",
+            "Person",
+            "Person",
+            IndexDirection::Outgoing,
+        ));
+        registry.register_direct_adjacency_bundle(first).unwrap();
+        registry
+            .register_direct_adjacency_bundle(bundle(directory.path(), "experimental", 1, 1).await)
+            .unwrap();
+        registry
+            .register_direct_adjacency_bundle(bundle(directory.path(), "primary", 2, 2).await)
+            .unwrap();
+
+        let key = GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing);
+        assert_eq!(
+            registry
+                .get_direct_adjacency_bundle("PRIMARY")
+                .unwrap()
+                .unwrap()
+                .metadata
+                .bundle_generation,
+            2
+        );
+        assert_eq!(
+            registry
+                .get_direct_adjacency("experimental", &key)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .generation,
+            1
+        );
+        assert_eq!(old_component.unwrap().metadata.generation, 1);
+
+        let error = registry
+            .register_direct_adjacency_bundle(bundle(directory.path(), "primary", 0, 3).await)
+            .unwrap_err();
         assert!(matches!(
             error,
             GraphError::IndexError {

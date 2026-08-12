@@ -34,8 +34,8 @@ pub use analysis::{PlanningContext, QueryAnalysis, RelationshipInstance};
 use crate::config::GraphConfig;
 use crate::error::Result;
 use crate::index::{
-    GraphIndexKey, GraphIndexRegistry, IndexDecision, IndexFallbackReason, IndexReference,
-    IndexUsagePolicy,
+    ExpandExecutionMode, ExpandIndexReference, ExpandPlanDecision, GraphIndexKey,
+    GraphIndexRegistry, IndexReference,
 };
 use crate::logical_plan::LogicalOperator;
 use crate::node_lookup::{NodeLookupKey, NodeLookupReference, NodeLookupRegistry};
@@ -54,7 +54,7 @@ pub struct DataFusionPlanner {
     pub(crate) catalog: Option<Arc<dyn GraphSourceCatalog>>,
     pub(crate) indexes: Option<Arc<dyn GraphIndexRegistry>>,
     pub(crate) node_lookups: Option<Arc<dyn NodeLookupRegistry>>,
-    pub(crate) index_policy: IndexUsagePolicy,
+    pub(crate) expand_mode: ExpandExecutionMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +81,7 @@ impl DataFusionPlanner {
             catalog: None,
             indexes: None,
             node_lookups: None,
-            index_policy: IndexUsagePolicy::Disabled,
+            expand_mode: ExpandExecutionMode::Join,
         }
     }
 
@@ -91,17 +91,17 @@ impl DataFusionPlanner {
             catalog: Some(catalog),
             indexes: None,
             node_lookups: None,
-            index_policy: IndexUsagePolicy::Disabled,
+            expand_mode: ExpandExecutionMode::Join,
         }
     }
 
     pub fn with_indexes(
         mut self,
         indexes: Arc<dyn GraphIndexRegistry>,
-        policy: IndexUsagePolicy,
+        expand_mode: ExpandExecutionMode,
     ) -> Self {
         self.indexes = Some(indexes);
-        self.index_policy = policy;
+        self.expand_mode = expand_mode;
         self
     }
 
@@ -110,8 +110,8 @@ impl DataFusionPlanner {
         self
     }
 
-    pub fn index_policy(&self) -> IndexUsagePolicy {
-        self.index_policy
+    pub fn expand_mode(&self) -> &ExpandExecutionMode {
+        &self.expand_mode
     }
 
     pub(crate) fn select_expand_index(
@@ -125,36 +125,37 @@ impl DataFusionPlanner {
         source_id_type: &arrow_schema::DataType,
         target_id_type: &arrow_schema::DataType,
         target_variable_reused: bool,
-    ) -> Result<IndexDecision> {
-        if self.index_policy == IndexUsagePolicy::Disabled {
-            return Ok(IndexDecision::Fallback(IndexFallbackReason::PolicyDisabled));
+    ) -> Result<ExpandPlanDecision> {
+        if self.expand_mode == ExpandExecutionMode::Join {
+            return Ok(ExpandPlanDecision::Join);
         }
-        let fallback = |reason| -> Result<IndexDecision> {
-            if self.index_policy == IndexUsagePolicy::Require {
-                Err(crate::error::GraphError::PlanError {
-                    message: format!(
-                        "CSR index required but traversal is not eligible: {reason:?}"
-                    ),
-                    location: snafu::Location::new(file!(), line!(), column!()),
-                })
-            } else {
-                Ok(IndexDecision::Fallback(reason))
-            }
+        let invalid = |reason: &str| -> Result<ExpandPlanDecision> {
+            Err(crate::error::GraphError::PlanError {
+                message: format!(
+                    "requested {:?} expand index is not eligible: {reason}",
+                    self.expand_mode
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
         };
         if relationship_types.len() != 1 {
-            return fallback(IndexFallbackReason::MultipleRelationshipTypes);
+            return invalid("multiple relationship types");
         }
-        if !matches!(direction, crate::ast::RelationshipDirection::Outgoing) {
-            return fallback(IndexFallbackReason::UnsupportedDirection);
-        }
+        let index_direction = match direction {
+            crate::ast::RelationshipDirection::Outgoing => crate::index::IndexDirection::Outgoing,
+            crate::ast::RelationshipDirection::Incoming => crate::index::IndexDirection::Incoming,
+            crate::ast::RelationshipDirection::Undirected => {
+                return invalid("undirected traversal");
+            }
+        };
         if relationship_variable.is_some() {
-            return fallback(IndexFallbackReason::RelationshipVariableUsed);
+            return invalid("relationship variable is used");
         }
         if !relationship_properties_empty {
-            return fallback(IndexFallbackReason::RelationshipPropertyRequired);
+            return invalid("relationship properties are required");
         }
         if target_variable_reused {
-            return fallback(IndexFallbackReason::TargetVariableReused);
+            return invalid("target variable is reused");
         }
         if !matches!(
             source_id_type,
@@ -163,30 +164,75 @@ impl DataFusionPlanner {
                 | arrow_schema::DataType::Int32
                 | arrow_schema::DataType::Int64
         ) {
-            return fallback(IndexFallbackReason::UnsupportedIdType);
+            return invalid("unsupported ID type");
         }
         if source_id_type != target_id_type {
-            return fallback(IndexFallbackReason::SchemaMismatch);
+            return invalid("source and target ID types differ");
         }
         let key = GraphIndexKey::new(
             &relationship_types[0],
             source_label,
             target_label,
-            crate::index::IndexDirection::Outgoing,
+            index_direction,
         );
         let Some(registry) = &self.indexes else {
-            return fallback(IndexFallbackReason::IndexNotFound);
+            return Err(crate::error::GraphError::PlanError {
+                message: format!(
+                    "requested {:?} expand index requires a graph index registry",
+                    self.expand_mode
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
         };
-        let Some(handle) = registry.get_csr(&key)? else {
-            return fallback(IndexFallbackReason::IndexNotFound);
-        };
-        if handle.metadata.id_data_type != *source_id_type {
-            return fallback(IndexFallbackReason::SchemaMismatch);
+        match &self.expand_mode {
+            ExpandExecutionMode::Csr => {
+                let handle =
+                    registry
+                        .get_csr(&key)?
+                        .ok_or_else(|| crate::error::GraphError::PlanError {
+                            message: format!("requested CSR index not found for {key:?}"),
+                            location: snafu::Location::new(file!(), line!(), column!()),
+                        })?;
+                if handle.metadata.id_data_type != *source_id_type {
+                    return invalid("CSR metadata ID type mismatch");
+                }
+                Ok(ExpandPlanDecision::Indexed(ExpandIndexReference::Csr(
+                    IndexReference {
+                        key,
+                        generation: handle.metadata.generation,
+                    },
+                )))
+            }
+            ExpandExecutionMode::DirectAdjacency { index_name } => {
+                let bundle = registry
+                    .get_direct_adjacency_bundle(index_name)?
+                    .ok_or_else(|| crate::error::GraphError::PlanError {
+                        message: format!(
+                            "requested Direct Adjacency bundle {index_name:?} is not registered"
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+                let handle = registry
+                    .get_direct_adjacency(index_name, &key)?
+                    .ok_or_else(|| {
+                    crate::error::GraphError::PlanError {
+                        message: format!(
+                            "requested Direct Adjacency component not found in bundle {index_name:?} for {key:?}"
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    }
+                })?;
+                if handle.metadata.id_data_type != *source_id_type {
+                    return invalid("Direct Adjacency metadata ID type mismatch");
+                }
+                Ok(ExpandPlanDecision::Indexed(
+                    ExpandIndexReference::DirectAdjacency(
+                        handle.reference(index_name, bundle.metadata.bundle_generation),
+                    ),
+                ))
+            }
+            ExpandExecutionMode::Join => unreachable!(),
         }
-        Ok(IndexDecision::Use(IndexReference {
-            key,
-            generation: handle.metadata.generation,
-        }))
     }
 
     pub(crate) fn select_target_access(

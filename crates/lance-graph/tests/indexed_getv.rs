@@ -18,8 +18,10 @@ use lance::datafusion::LanceTableProvider;
 use lance::dataset::{Dataset, WriteParams};
 use lance_graph::datafusion_planner::get_v::LanceGetVByIdExec;
 use lance_graph::{
-    CsrIndexBuilder, CsrIndexHandle, CypherQuery, GraphConfig, GraphIndexKey, GraphIndexMetadata,
-    InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection, IndexUsagePolicy,
+    CsrIndexBuilder, CsrIndexHandle, CypherQuery, DirectAdjacencyIndexBuilder,
+    DirectAdjacencyMetadata, ExpandExecutionMode, GraphConfig, GraphIndexKey, GraphIndexMetadata,
+    InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection,
+    MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexStore,
 };
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};
@@ -63,10 +65,53 @@ fn edge_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn reversed_edge_batch() -> RecordBatch {
+    let edges = edge_batch();
+    RecordBatch::try_new(
+        edges.schema(),
+        vec![edges.column(1).clone(), edges.column(0).clone()],
+    )
+    .unwrap()
+}
+
+fn company_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("company_id", DataType::Int64, false),
+        Field::new("company_name", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![100, 101])),
+            Arc::new(StringArray::from(vec!["c100", "c101"])),
+        ],
+    )
+    .unwrap()
+}
+
+fn works_at_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("src_id", DataType::Int64, false),
+        Field::new("dst_id", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![100, 100, 101, 101, 100])),
+        ],
+    )
+    .unwrap()
+}
+
 fn graph_config() -> GraphConfig {
     GraphConfig::builder()
         .with_node_label("Person", "person_id")
+        .with_node_label("Company", "company_id")
         .with_relationship("FRIEND_OF", "src_id", "dst_id")
+        .with_relationship("FOLLOWS", "src_id", "dst_id")
+        .with_relationship("BLOCKS", "src_id", "dst_id")
+        .with_relationship("WORKS_AT", "src_id", "dst_id")
         .build()
         .unwrap()
 }
@@ -107,8 +152,14 @@ fn graph_indexes() -> Arc<InMemoryGraphIndexRegistry> {
 fn mem_graph() -> TestGraph {
     let nodes = node_batch();
     let edges = edge_batch();
+    let companies = company_batch();
+    let works_at = works_at_batch();
     let node_provider = Arc::new(MemTable::try_new(nodes.schema(), vec![vec![nodes]]).unwrap());
     let edge_provider = Arc::new(MemTable::try_new(edges.schema(), vec![vec![edges]]).unwrap());
+    let company_provider =
+        Arc::new(MemTable::try_new(companies.schema(), vec![vec![companies]]).unwrap());
+    let works_at_provider =
+        Arc::new(MemTable::try_new(works_at.schema(), vec![vec![works_at]]).unwrap());
     let context = SessionContext::new();
     context
         .register_table("person", node_provider.clone())
@@ -116,12 +167,30 @@ fn mem_graph() -> TestGraph {
     context
         .register_table("friend_of", edge_provider.clone())
         .unwrap();
+    context
+        .register_table("follows", edge_provider.clone())
+        .unwrap();
+    context
+        .register_table("company", company_provider.clone())
+        .unwrap();
+    context
+        .register_table("works_at", works_at_provider.clone())
+        .unwrap();
     let catalog = Arc::new(
         InMemoryCatalog::new()
             .with_node_source("Person", Arc::new(DefaultTableSource::new(node_provider)))
+            .with_node_source(
+                "Company",
+                Arc::new(DefaultTableSource::new(company_provider)),
+            )
             .with_relationship_source(
                 "FRIEND_OF",
-                Arc::new(DefaultTableSource::new(edge_provider)),
+                Arc::new(DefaultTableSource::new(edge_provider.clone())),
+            )
+            .with_relationship_source("FOLLOWS", Arc::new(DefaultTableSource::new(edge_provider)))
+            .with_relationship_source(
+                "WORKS_AT",
+                Arc::new(DefaultTableSource::new(works_at_provider)),
             ),
     );
     let query = CypherQuery::new(
@@ -160,8 +229,35 @@ async fn lance_graph(with_scalar_index: bool) -> (tempfile::TempDir, TestGraph) 
     }
     let dataset = Arc::new(Dataset::open(uri.to_str().unwrap()).await.unwrap());
     let node_provider = Arc::new(LanceTableProvider::new(dataset, false, false));
+    let company_uri = temp.path().join("company.lance");
+    let companies = company_batch();
+    let company_reader = RecordBatchIterator::new(vec![Ok(companies.clone())], companies.schema());
+    let mut company_dataset = Dataset::write(
+        company_reader,
+        company_uri.to_str().unwrap(),
+        Some(WriteParams::default()),
+    )
+    .await
+    .unwrap();
+    if with_scalar_index {
+        company_dataset
+            .create_index(
+                &["company_id"],
+                IndexType::BTree,
+                Some("company_id_btree".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let company_dataset = Arc::new(Dataset::open(company_uri.to_str().unwrap()).await.unwrap());
+    let company_provider = Arc::new(LanceTableProvider::new(company_dataset, false, false));
     let edges = edge_batch();
+    let works_at = works_at_batch();
     let edge_provider = Arc::new(MemTable::try_new(edges.schema(), vec![vec![edges]]).unwrap());
+    let works_at_provider =
+        Arc::new(MemTable::try_new(works_at.schema(), vec![vec![works_at]]).unwrap());
     let context = SessionContext::new();
     context
         .register_table("person", node_provider.clone())
@@ -169,12 +265,30 @@ async fn lance_graph(with_scalar_index: bool) -> (tempfile::TempDir, TestGraph) 
     context
         .register_table("friend_of", edge_provider.clone())
         .unwrap();
+    context
+        .register_table("follows", edge_provider.clone())
+        .unwrap();
+    context
+        .register_table("company", company_provider.clone())
+        .unwrap();
+    context
+        .register_table("works_at", works_at_provider.clone())
+        .unwrap();
     let catalog = Arc::new(
         InMemoryCatalog::new()
             .with_node_source("Person", Arc::new(DefaultTableSource::new(node_provider)))
+            .with_node_source(
+                "Company",
+                Arc::new(DefaultTableSource::new(company_provider)),
+            )
             .with_relationship_source(
                 "FRIEND_OF",
-                Arc::new(DefaultTableSource::new(edge_provider)),
+                Arc::new(DefaultTableSource::new(edge_provider.clone())),
+            )
+            .with_relationship_source("FOLLOWS", Arc::new(DefaultTableSource::new(edge_provider)))
+            .with_relationship_source(
+                "WORKS_AT",
+                Arc::new(DefaultTableSource::new(works_at_provider)),
             ),
     );
     let query = CypherQuery::new(
@@ -278,6 +392,24 @@ fn rows_as_multiset(batch: &RecordBatch) -> BTreeMap<(i64, String, i64, String),
     rows
 }
 
+fn id_pairs(batch: &RecordBatch) -> Vec<(i64, i64)> {
+    let source_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let target_ids = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut pairs = (0..batch.num_rows())
+        .map(|row| (source_ids.value(row), target_ids.value(row)))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs
+}
+
 #[tokio::test]
 async fn indexed_expand_getv_matches_join_and_removes_target_hash_join() {
     let (_temp, graph) = lance_graph(true).await;
@@ -292,7 +424,7 @@ async fn indexed_expand_getv_matches_join_and_removes_target_hash_join() {
             graph.catalog.clone(),
             graph.context.clone(),
             graph.indexes.clone(),
-            IndexUsagePolicy::Require,
+            ExpandExecutionMode::Csr,
         )
         .await
         .unwrap();
@@ -320,10 +452,10 @@ async fn indexed_expand_getv_matches_join_and_removes_target_hash_join() {
     let getv = graph
         .query
         .execute_with_catalog_context_and_indexes(
-            graph.catalog,
-            graph.context,
-            graph.indexes,
-            IndexUsagePolicy::Require,
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::Csr,
         )
         .await
         .unwrap();
@@ -342,10 +474,10 @@ async fn lance_target_without_scalar_index_falls_back_to_target_join() {
     let explain = graph
         .query
         .explain_with_catalog_context_and_indexes(
-            graph.catalog,
-            graph.context,
-            graph.indexes,
-            IndexUsagePolicy::Require,
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::Csr,
         )
         .await
         .unwrap();
@@ -361,7 +493,309 @@ async fn lance_target_without_scalar_index_falls_back_to_target_join() {
 }
 
 #[tokio::test]
-async fn memtable_and_missing_csr_keep_the_existing_join_fallbacks() {
+async fn direct_adjacency_getv_matches_join_and_uses_only_the_selected_backend() {
+    let (_temp, graph) = lance_graph(true).await;
+    let direct_uri = _temp.path().join("direct-generation-1");
+    let incoming_uri = _temp.path().join("incoming-direct-generation-1");
+    let follows_uri = _temp.path().join("follows-direct-generation-1");
+    let works_at_uri = _temp.path().join("works-at-direct-generation-1");
+    let edges = edge_batch();
+    let metadata = DirectAdjacencyMetadata {
+        key: GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
+        source_id_field: "src_id".into(),
+        target_id_field: "person_id".into(),
+        adjacency_field: "dst_ids".into(),
+        id_data_type: DataType::Int64,
+        num_sources: 0,
+        num_edges: 0,
+        dataset_uri: String::new(),
+        dataset_version: 0,
+        scalar_index_name: "src_id_btree".into(),
+        source_uri: None,
+        source_version: None,
+        generation: 2,
+    };
+    let descriptor = DirectAdjacencyIndexBuilder::new(metadata)
+        .unwrap()
+        .add_edges_from_batch(&edges)
+        .unwrap()
+        .build_and_persist(direct_uri.to_str().unwrap(), Default::default())
+        .await
+        .unwrap();
+    let incoming_descriptor = DirectAdjacencyIndexBuilder::new(DirectAdjacencyMetadata {
+        key: GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Incoming),
+        source_id_field: "dst_id".into(),
+        target_id_field: "person_id".into(),
+        adjacency_field: "src_ids".into(),
+        id_data_type: DataType::Int64,
+        num_sources: 0,
+        num_edges: 0,
+        dataset_uri: String::new(),
+        dataset_version: 0,
+        scalar_index_name: "incoming_dst_id_btree".into(),
+        source_uri: None,
+        source_version: None,
+        generation: 2,
+    })
+    .unwrap()
+    .add_edges_from_batch(&reversed_edge_batch())
+    .unwrap()
+    .build_and_persist(incoming_uri.to_str().unwrap(), Default::default())
+    .await
+    .unwrap();
+    let follows_descriptor = DirectAdjacencyIndexBuilder::new(DirectAdjacencyMetadata {
+        key: GraphIndexKey::new("FOLLOWS", "Person", "Person", IndexDirection::Outgoing),
+        source_id_field: "src_id".into(),
+        target_id_field: "person_id".into(),
+        adjacency_field: "dst_ids".into(),
+        id_data_type: DataType::Int64,
+        num_sources: 0,
+        num_edges: 0,
+        dataset_uri: String::new(),
+        dataset_version: 0,
+        scalar_index_name: "follows_src_id_btree".into(),
+        source_uri: None,
+        source_version: None,
+        generation: 2,
+    })
+    .unwrap()
+    .add_edges_from_batch(&edges)
+    .unwrap()
+    .build_and_persist(follows_uri.to_str().unwrap(), Default::default())
+    .await
+    .unwrap();
+    let works_at_descriptor = DirectAdjacencyIndexBuilder::new(DirectAdjacencyMetadata {
+        key: GraphIndexKey::new("WORKS_AT", "Person", "Company", IndexDirection::Outgoing),
+        source_id_field: "src_id".into(),
+        target_id_field: "company_id".into(),
+        adjacency_field: "dst_ids".into(),
+        id_data_type: DataType::Int64,
+        num_sources: 0,
+        num_edges: 0,
+        dataset_uri: String::new(),
+        dataset_version: 0,
+        scalar_index_name: "works_at_src_id_btree".into(),
+        source_uri: None,
+        source_version: None,
+        generation: 2,
+    })
+    .unwrap()
+    .add_edges_from_batch(&works_at_batch())
+    .unwrap()
+    .build_and_persist(works_at_uri.to_str().unwrap(), Default::default())
+    .await
+    .unwrap();
+    let bundle_uri = _temp.path().join("direct-bundle-generation-1");
+    let bundle_descriptor = MultiTypeDirectAdjacencyIndexBuilder::new("social_adjacency", 2)
+        .unwrap()
+        .add_component(descriptor)
+        .unwrap()
+        .add_component(incoming_descriptor)
+        .unwrap()
+        .add_component(follows_descriptor)
+        .unwrap()
+        .add_component(works_at_descriptor)
+        .unwrap()
+        .build_and_persist(bundle_uri.to_str().unwrap())
+        .await
+        .unwrap();
+    let handle = MultiTypeDirectAdjacencyIndexStore::load(&bundle_descriptor, Default::default())
+        .await
+        .unwrap();
+    graph
+        .indexes
+        .register_direct_adjacency_bundle(handle)
+        .unwrap();
+    let direct_mode = ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap();
+
+    let baseline = graph
+        .query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let explain = graph
+        .query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            direct_mode.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(explain.contains("DirectAdjacencyExpandExec"), "{explain}");
+    assert!(explain.contains("index_name=social_adjacency"), "{explain}");
+    assert!(explain.contains("relationship_type=friend_of"), "{explain}");
+    assert!(explain.contains("LanceGetVByIdExec"), "{explain}");
+    assert!(!explain.contains("IndexedExpandExec"), "{explain}");
+    assert!(!explain.contains("HashJoinExec"), "{explain}");
+    assert!(
+        !explain.to_lowercase().contains("tablescan: friend_of"),
+        "{explain}"
+    );
+
+    let direct = graph
+        .query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            direct_mode,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_as_multiset(&direct), rows_as_multiset(&baseline));
+
+    let follows_query = CypherQuery::new(
+        "MATCH (a:Person)-[:FOLLOWS]->(b:Person {age: 20}) \
+         RETURN a.person_id, a.name, b.person_id, b.name",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let follows_baseline = follows_query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let follows_explain = follows_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        follows_explain.contains("relationship_type=follows"),
+        "{follows_explain}"
+    );
+    assert!(
+        !follows_explain.contains("relationship_type=friend_of"),
+        "{follows_explain}"
+    );
+    let follows_direct = follows_query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_as_multiset(&follows_direct),
+        rows_as_multiset(&follows_baseline)
+    );
+
+    let incoming_query = CypherQuery::new(
+        "MATCH (b:Person)<-[:FRIEND_OF]-(a:Person) \
+         RETURN b.person_id, b.name, a.person_id, a.name",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let incoming_baseline = incoming_query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let incoming_explain = incoming_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        incoming_explain.contains("direction=Incoming"),
+        "{incoming_explain}"
+    );
+    let incoming_direct = incoming_query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_as_multiset(&incoming_direct),
+        rows_as_multiset(&incoming_baseline)
+    );
+
+    let cross_label_query = CypherQuery::new(
+        "MATCH (a:Person)-[:WORKS_AT]->(c:Company) \
+         RETURN a.person_id, c.company_id",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let cross_label_baseline = cross_label_query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let cross_label_explain = cross_label_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cross_label_explain.contains("target_label=company"),
+        "{cross_label_explain}"
+    );
+    assert!(
+        cross_label_explain.contains("LanceGetVByIdExec"),
+        "{cross_label_explain}"
+    );
+    let cross_label_direct = cross_label_query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        id_pairs(&cross_label_direct),
+        id_pairs(&cross_label_baseline)
+    );
+
+    let error = follows_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::direct_adjacency("missing_bundle").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error}").contains("missing_bundle"), "{error}");
+
+    let missing_component_query = CypherQuery::new(
+        "MATCH (a:Person)-[:BLOCKS]->(b:Person) \
+         RETURN a.person_id, a.name, b.person_id, b.name",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let error = missing_component_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog,
+            graph.context,
+            graph.indexes,
+            ExpandExecutionMode::direct_adjacency("social_adjacency").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error}").contains("blocks"), "{error}");
+}
+
+#[tokio::test]
+async fn memtable_join_mode_and_missing_csr_are_explicit() {
     let graph = mem_graph();
     let explain = graph
         .query
@@ -369,19 +803,12 @@ async fn memtable_and_missing_csr_keep_the_existing_join_fallbacks() {
             graph.catalog.clone(),
             graph.context.clone(),
             graph.indexes,
-            IndexUsagePolicy::Require,
+            ExpandExecutionMode::Csr,
         )
         .await
         .unwrap();
-    assert!(
-        explain.contains("IndexedExpandExec"),
-        "missing CSR path:\n{explain}"
-    );
-    assert!(!explain.contains("GetV:"), "MemTable used GetV:\n{explain}");
-    assert!(
-        explain.contains("HashJoinExec"),
-        "MemTable target did not use target join:\n{explain}"
-    );
+    assert!(explain.contains("IndexedExpandExec"), "{explain}");
+    assert!(explain.contains("HashJoinExec"), "{explain}");
 
     let graph = mem_graph();
     let empty_indexes = Arc::new(InMemoryGraphIndexRegistry::new());
@@ -391,7 +818,7 @@ async fn memtable_and_missing_csr_keep_the_existing_join_fallbacks() {
             graph.catalog.clone(),
             graph.context.clone(),
             empty_indexes.clone(),
-            IndexUsagePolicy::Prefer,
+            ExpandExecutionMode::Join,
         )
         .await
         .unwrap();
@@ -409,11 +836,14 @@ async fn memtable_and_missing_csr_keep_the_existing_join_fallbacks() {
             graph.catalog,
             graph.context,
             empty_indexes,
-            IndexUsagePolicy::Require,
+            ExpandExecutionMode::Csr,
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("CSR index required"), "{error}");
+    assert!(
+        error.to_string().to_lowercase().contains("csr index"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

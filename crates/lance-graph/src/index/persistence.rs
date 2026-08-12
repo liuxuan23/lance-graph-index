@@ -1,6 +1,5 @@
 use super::{
     CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, InMemoryGraphIndexRegistry, IndexDirection,
-    IndexUsagePolicy,
 };
 use crate::csr_index::CsrIndex;
 use crate::error::{GraphError, GraphIndexErrorKind, Result};
@@ -445,29 +444,15 @@ impl CsrIndexStore {
         })
     }
 
-    /// Load and register one persisted generation according to query policy.
-    /// Returns `true` when the requested generation was registered.
+    /// Load and register one persisted generation. Invalid generations return an error.
     pub async fn load_into_registry(
         descriptor: &PersistedCsrIndexDescriptor,
         options: CsrIndexLoadOptions,
         registry: &InMemoryGraphIndexRegistry,
-        policy: IndexUsagePolicy,
     ) -> Result<bool> {
-        if policy == IndexUsagePolicy::Disabled {
-            return Ok(false);
-        }
-        let handle = match Self::load(descriptor, options).await {
-            Ok(handle) => handle,
-            Err(GraphError::IndexError { .. }) if policy == IndexUsagePolicy::Prefer => {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
-        match registry.register_loaded_csr(handle) {
-            Ok(()) => Ok(true),
-            Err(GraphError::IndexError { .. }) if policy == IndexUsagePolicy::Prefer => Ok(false),
-            Err(error) => Err(error),
-        }
+        let handle = Self::load(descriptor, options).await?;
+        registry.register_loaded_csr(handle)?;
+        Ok(true)
     }
 }
 
@@ -1042,7 +1027,7 @@ mod tests {
         ));
 
         let registry = InMemoryGraphIndexRegistry::new();
-        let loaded = CsrIndexStore::load_into_registry(
+        let stale_load = CsrIndexStore::load_into_registry(
             &descriptor,
             CsrIndexLoadOptions {
                 source_validation: IndexSourceValidation::RequireExact(GraphSourceIdentity {
@@ -1052,11 +1037,16 @@ mod tests {
                 ..Default::default()
             },
             &registry,
-            IndexUsagePolicy::Prefer,
         )
         .await
-        .unwrap();
-        assert!(!loaded);
+        .unwrap_err();
+        assert!(matches!(
+            stale_load,
+            GraphError::IndexError {
+                kind: GraphIndexErrorKind::Stale,
+                ..
+            }
+        ));
 
         let limited = CsrIndexStore::load(
             &descriptor,
@@ -1297,7 +1287,6 @@ mod tests {
             &descriptor,
             Default::default(),
             registry.as_ref(),
-            IndexUsagePolicy::Require,
         )
         .await
         .unwrap());
@@ -1366,7 +1355,7 @@ mod tests {
                 catalog,
                 indexed_context,
                 registry,
-                IndexUsagePolicy::Require,
+                crate::index::ExpandExecutionMode::Csr,
             )
             .await
             .unwrap();

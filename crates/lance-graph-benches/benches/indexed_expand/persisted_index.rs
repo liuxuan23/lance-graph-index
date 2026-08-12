@@ -16,7 +16,7 @@ use criterion::{
 };
 use lance_graph::{
     CsrIndexBuilder, CsrIndexHandle, CsrIndexStore, GraphIndexKey, GraphIndexMetadata,
-    InMemoryGraphIndexRegistry, IndexDirection, IndexUsagePolicy,
+    InMemoryGraphIndexRegistry, IndexDirection,
 };
 
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
@@ -165,7 +165,6 @@ fn bench_persisted_index(c: &mut Criterion) {
                             &descriptor,
                             Default::default(),
                             &registry,
-                            IndexUsagePolicy::Require,
                         ))
                         .unwrap(),
                     )
@@ -210,7 +209,6 @@ fn bench_persisted_index(c: &mut Criterion) {
                                 &descriptor,
                                 Default::default(),
                                 &registry,
-                                IndexUsagePolicy::Require,
                             ))
                             .unwrap(),
                         )

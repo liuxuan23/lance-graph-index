@@ -1,4 +1,4 @@
-use super::{IndexedExpandExec, IndexedExpandNode};
+use super::{AdjacencyExpandNode, IndexedExpandExec};
 use crate::datafusion_planner::get_v::GetVExtensionPlanner;
 use crate::index::GraphIndexRegistry;
 use crate::node_lookup::NodeLookupRegistry;
@@ -29,25 +29,9 @@ impl ExtensionPlanner for IndexedExpandExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(node) = node.as_any().downcast_ref::<IndexedExpandNode>() else {
+        let Some(node) = node.as_any().downcast_ref::<AdjacencyExpandNode>() else {
             return Ok(None);
         };
-        let Some(handle) = self
-            .indexes
-            .get_csr(&node.index_ref().key)
-            .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?
-        else {
-            return Err(datafusion::common::DataFusionError::Plan(format!(
-                "CSR index not found for {:?} generation {}",
-                node.index_ref().key,
-                node.index_ref().generation
-            )));
-        };
-        if handle.metadata.generation != node.index_ref().generation {
-            return Err(datafusion::common::DataFusionError::Plan(
-                "CSR index generation changed during planning".into(),
-            ));
-        }
         let child = physical_inputs.first().ok_or_else(|| {
             datafusion::common::DataFusionError::Plan("IndexedExpand missing physical child".into())
         })?;
@@ -56,13 +40,75 @@ impl ExtensionPlanner for IndexedExpandExtensionPlanner {
             .field_with_unqualified_name(node.output_target_column())
             .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?
             .clone();
-        Ok(Some(Arc::new(IndexedExpandExec::try_new(
-            child.clone(),
-            handle.index.clone(),
-            node.source_column(),
-            field.into(),
-            node.max_output_batch_rows(),
-        )?)))
+        match node.index_ref() {
+            crate::index::ExpandIndexReference::Csr(reference) => {
+                let Some(handle) = self
+                    .indexes
+                    .get_csr(&reference.key)
+                    .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?
+                else {
+                    return Err(datafusion::common::DataFusionError::Plan(format!(
+                        "CSR index not found for {:?}",
+                        reference.key
+                    )));
+                };
+                if handle.metadata.generation != reference.generation {
+                    return Err(datafusion::common::DataFusionError::Plan(
+                        "CSR index generation changed during planning".into(),
+                    ));
+                }
+                Ok(Some(Arc::new(IndexedExpandExec::try_new(
+                    child.clone(),
+                    handle.index.clone(),
+                    node.source_column(),
+                    field.into(),
+                    node.max_output_batch_rows(),
+                )?)))
+            }
+            crate::index::ExpandIndexReference::DirectAdjacency(reference) => {
+                let Some(handle) = self
+                    .indexes
+                    .get_direct_adjacency(&reference.index_name, &reference.key)
+                    .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?
+                else {
+                    return Err(datafusion::common::DataFusionError::Plan(format!(
+                        "Direct Adjacency index not found for {:?}",
+                        reference.key
+                    )));
+                };
+                let bundle = self
+                    .indexes
+                    .get_direct_adjacency_bundle(&reference.index_name)
+                    .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Plan(format!(
+                            "Direct Adjacency bundle {:?} not found",
+                            reference.index_name
+                        ))
+                    })?;
+                if bundle.metadata.bundle_generation != reference.bundle_generation
+                    || handle.metadata.generation != reference.component_generation
+                    || handle.metadata.dataset_version != reference.dataset_version
+                {
+                    return Err(datafusion::common::DataFusionError::Plan(
+                        "Direct Adjacency index generation changed during planning".into(),
+                    ));
+                }
+                Ok(Some(Arc::new(
+                    super::physical::DirectAdjacencyExpandExec::try_new(
+                        child.clone(),
+                        handle,
+                        node.source_column(),
+                        field.into(),
+                        node.max_output_batch_rows(),
+                    )?
+                    .with_bundle_identity(
+                        reference.index_name.clone(),
+                        reference.bundle_generation,
+                    ),
+                )))
+            }
+        }
     }
 }
 

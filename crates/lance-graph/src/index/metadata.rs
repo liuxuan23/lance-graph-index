@@ -1,5 +1,8 @@
 use crate::csr_index::CsrIndex;
 use arrow_schema::DataType;
+use lance::Dataset;
+use lance_index::scalar::ScalarIndex;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -68,8 +71,82 @@ pub struct CsrIndexHandle {
     pub metadata: GraphIndexMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAdjacencyMetadata {
+    pub key: GraphIndexKey,
+    pub source_id_field: String,
+    pub target_id_field: String,
+    pub adjacency_field: String,
+    pub id_data_type: DataType,
+    pub num_sources: u64,
+    pub num_edges: u64,
+    pub dataset_uri: String,
+    pub dataset_version: u64,
+    pub scalar_index_name: String,
+    pub source_uri: Option<String>,
+    pub source_version: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+pub struct DirectAdjacencyIndexHandle {
+    pub dataset: Arc<Dataset>,
+    pub scalar_index: Arc<dyn ScalarIndex>,
+    pub metadata: DirectAdjacencyMetadata,
+}
+
+impl DirectAdjacencyIndexHandle {
+    pub fn reference(
+        &self,
+        index_name: impl Into<String>,
+        bundle_generation: u64,
+    ) -> DirectAdjacencyReference {
+        DirectAdjacencyReference {
+            index_name: index_name.into(),
+            bundle_generation,
+            key: self.metadata.key.clone(),
+            component_generation: self.metadata.generation,
+            dataset_version: self.metadata.dataset_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiTypeDirectAdjacencyMetadata {
+    pub index_name: String,
+    pub bundle_generation: u64,
+    pub num_components: u64,
+    pub num_sources: u64,
+    pub num_edges: u64,
+}
+
+#[derive(Debug)]
+pub struct MultiTypeDirectAdjacencyIndexHandle {
+    pub metadata: MultiTypeDirectAdjacencyMetadata,
+    pub components: BTreeMap<GraphIndexKey, Arc<DirectAdjacencyIndexHandle>>,
+}
+
+impl MultiTypeDirectAdjacencyIndexHandle {
+    pub fn get(&self, key: &GraphIndexKey) -> Option<Arc<DirectAdjacencyIndexHandle>> {
+        self.components.get(key).cloned()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &GraphIndexKey> {
+        self.components.keys()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IndexReference {
     pub key: GraphIndexKey,
     pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DirectAdjacencyReference {
+    pub index_name: String,
+    pub bundle_generation: u64,
+    pub key: GraphIndexKey,
+    pub component_generation: u64,
+    pub dataset_version: u64,
 }

@@ -105,7 +105,7 @@ the existing in-memory query path after a process restart:
 use std::sync::Arc;
 use lance_graph::{
     CsrIndexLoadOptions, CsrIndexStore, CsrIndexWriteOptions,
-    InMemoryGraphIndexRegistry, IndexUsagePolicy,
+    ExpandExecutionMode, InMemoryGraphIndexRegistry,
 };
 
 // `handle` contains an already-built CsrIndex plus GraphIndexMetadata.
@@ -124,14 +124,13 @@ CsrIndexStore::load_into_registry(
     &descriptor,
     CsrIndexLoadOptions::default(),
     registry.as_ref(),
-    IndexUsagePolicy::Require,
 ).await?;
 
 let result = query.execute_with_catalog_context_and_indexes(
     catalog,
     context,
     registry,
-    IndexUsagePolicy::Require,
+    ExpandExecutionMode::Csr,
 ).await?;
 ```
 
@@ -149,6 +148,55 @@ Published generations are immutable. Loading validates the manifest, component
 schemas and versions, CSR offsets and neighbor IDs, optional source URI/version,
 and configured memory limits. The loaded index then resides in memory; query-time
 random access directly against the persisted files is not part of this version.
+
+## Direct Adjacency Indexes
+
+Direct adjacency indexes store one Lance row per source as `src_id + List<dst_id>` and build a
+BTree scalar index over `src_id`. A named logical bundle can contain one component per
+relationship type, label pair, and direction. Components remain physically separate, so an exact
+type query does not read or decode other relationship types. The backend and bundle name are
+selected explicitly; a missing or incompatible component never falls back to CSR or a
+relationship join.
+
+```rust,ignore
+let friend_of = DirectAdjacencyIndexBuilder::new(friend_of_metadata)?
+    .add_edges_from_batch(&edges)?
+    .build_and_persist(
+        "/data/graph-indexes/social/generation-7/components/friend-of",
+        Default::default(),
+    )
+    .await?;
+let follows = DirectAdjacencyIndexBuilder::new(follows_metadata)?
+    .add_edges_from_batch(&follows_edges)?
+    .build_and_persist(
+        "/data/graph-indexes/social/generation-7/components/follows",
+        Default::default(),
+    )
+    .await?;
+let descriptor = MultiTypeDirectAdjacencyIndexBuilder::new("social_adjacency", 7)?
+    .add_component(friend_of)?
+    .add_component(follows)?
+    .build_and_persist("/data/graph-indexes/social/generation-7")
+    .await?;
+let handle = MultiTypeDirectAdjacencyIndexStore::load(
+    &descriptor,
+    Default::default(),
+).await?;
+registry.register_direct_adjacency_bundle(handle)?;
+let result = query.execute_with_catalog_context_and_indexes(
+    catalog,
+    context,
+    registry,
+    ExpandExecutionMode::direct_adjacency("social_adjacency")?,
+).await?;
+```
+
+The bundle descriptor is published after all component descriptors and datasets have been
+validated. Loading is all-or-nothing and checks each immutable Dataset version, nested schema,
+source identity, edge multiplicity, and scalar-index fragment coverage. `UInt32`, `UInt64`,
+`Int32`, and `Int64` semantic IDs are supported. Relationship properties and relationship
+variables are not eligible for the Direct backend and produce a planning error when it is
+explicitly requested.
 
 ## Supported Cypher Surface
 

@@ -573,15 +573,13 @@ impl CypherQuery {
         })
     }
 
-    /// Execute with an explicitly registered CSR index. The caller controls the
-    /// index policy; the regular execution API remains unchanged and therefore
-    /// continues to use the relationship-join path.
+    /// Execute with the explicitly selected Expand backend.
     pub async fn execute_with_catalog_context_and_indexes(
         &self,
         catalog: Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
         indexes: Arc<dyn crate::index::GraphIndexRegistry>,
-        index_policy: crate::index::IndexUsagePolicy,
+        expand_mode: crate::index::ExpandExecutionMode,
     ) -> Result<arrow::record_batch::RecordBatch> {
         use crate::datafusion_planner::indexed_expand::GraphQueryPlanner;
         use crate::node_lookup::discover_lance_node_lookups;
@@ -593,7 +591,7 @@ impl CypherQuery {
             catalog,
             Some(indexes.clone()),
             Some(node_lookups.clone()),
-            index_policy,
+            expand_mode,
         )?;
         // Install a planner on the supplied context without changing the
         // context's registered tables or other session configuration.
@@ -628,14 +626,14 @@ impl CypherQuery {
         })
     }
 
-    /// Explain an indexed query using the same CSR and node-lookup resources
+    /// Explain a query using the same selected Expand backend and node-lookup resources
     /// that will be used by [`Self::execute_with_catalog_context_and_indexes`].
     pub async fn explain_with_catalog_context_and_indexes(
         &self,
         catalog: Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
         indexes: Arc<dyn crate::index::GraphIndexRegistry>,
-        index_policy: crate::index::IndexUsagePolicy,
+        expand_mode: crate::index::ExpandExecutionMode,
     ) -> Result<String> {
         use crate::datafusion_planner::indexed_expand::GraphQueryPlanner;
         use crate::node_lookup::discover_lance_node_lookups;
@@ -646,7 +644,7 @@ impl CypherQuery {
             catalog,
             Some(indexes.clone()),
             Some(node_lookups.clone()),
-            index_policy,
+            expand_mode,
         )?;
         let state_ref = ctx.state_ref();
         let current_state = state_ref.read().clone();
@@ -919,7 +917,7 @@ impl CypherQuery {
         self.create_logical_plans_with_indexes(
             catalog,
             None,
-            crate::index::IndexUsagePolicy::Disabled,
+            crate::index::ExpandExecutionMode::Join,
         )
     }
 
@@ -927,12 +925,12 @@ impl CypherQuery {
         &self,
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         indexes: Option<Arc<dyn crate::index::GraphIndexRegistry>>,
-        index_policy: crate::index::IndexUsagePolicy,
+        expand_mode: crate::index::ExpandExecutionMode,
     ) -> Result<(
         crate::logical_plan::LogicalOperator,
         datafusion::logical_expr::LogicalPlan,
     )> {
-        self.create_logical_plans_with_resources(catalog, indexes, None, index_policy)
+        self.create_logical_plans_with_resources(catalog, indexes, None, expand_mode)
     }
 
     fn create_logical_plans_with_resources(
@@ -940,7 +938,7 @@ impl CypherQuery {
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         indexes: Option<Arc<dyn crate::index::GraphIndexRegistry>>,
         node_lookups: Option<Arc<dyn crate::node_lookup::NodeLookupRegistry>>,
-        index_policy: crate::index::IndexUsagePolicy,
+        expand_mode: crate::index::ExpandExecutionMode,
     ) -> Result<(
         crate::logical_plan::LogicalOperator,
         datafusion::logical_expr::LogicalPlan,
@@ -968,7 +966,7 @@ impl CypherQuery {
         // Phase 3: DataFusion Logical Plan
         let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
         let mut df_planner = if let Some(indexes) = indexes {
-            df_planner.with_indexes(indexes, index_policy)
+            df_planner.with_indexes(indexes, expand_mode)
         } else {
             df_planner
         };
@@ -2201,7 +2199,7 @@ mod tests {
     async fn test_execute_with_csr_index_uses_indexed_expand() {
         use crate::index::{
             CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, InMemoryGraphIndexRegistry,
-            IndexDirection, IndexUsagePolicy,
+            IndexDirection,
         };
         use arrow_array::{Int64Array, RecordBatch, StringArray};
         use arrow_schema::{DataType, Field, Schema};
@@ -2280,7 +2278,7 @@ mod tests {
                 catalog,
                 ctx,
                 registry,
-                IndexUsagePolicy::Require,
+                crate::index::ExpandExecutionMode::Csr,
             )
             .await
             .unwrap();

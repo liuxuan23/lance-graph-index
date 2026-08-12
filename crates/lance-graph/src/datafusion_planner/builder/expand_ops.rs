@@ -39,9 +39,12 @@ impl DataFusionPlanner {
         };
         let Some(cat) = &self.catalog else {
             // Fallback: pass-through if catalog not available
-            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+            if self.expand_mode != crate::index::ExpandExecutionMode::Join {
                 return Err(crate::error::GraphError::PlanError {
-                    message: format!("CSR index is required for relationship '{}' but no graph catalog is configured", rel_type),
+                    message: format!(
+                        "requested {:?} expand index for relationship '{}' requires a graph catalog",
+                        self.expand_mode, rel_type
+                    ),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 });
             }
@@ -51,11 +54,11 @@ impl DataFusionPlanner {
         let rel_instance = ctx.next_relationship_instance(rel_type)?;
         // Use case-insensitive lookups
         let Some(rel_map) = self.config.get_relationship_mapping(rel_type) else {
-            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+            if self.expand_mode != crate::index::ExpandExecutionMode::Join {
                 return Err(crate::error::GraphError::PlanError {
                     message: format!(
-                        "CSR index is required but relationship mapping '{}' is missing",
-                        rel_type
+                        "requested {:?} expand index requires relationship mapping '{}'",
+                        self.expand_mode, rel_type
                     ),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 });
@@ -64,11 +67,11 @@ impl DataFusionPlanner {
         };
 
         let Some(src_label) = ctx.analysis.var_to_label.get(source_variable) else {
-            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+            if self.expand_mode != crate::index::ExpandExecutionMode::Join {
                 return Err(crate::error::GraphError::PlanError {
                     message: format!(
-                        "CSR index is required but source variable '{}' has no label",
-                        source_variable
+                        "requested {:?} expand index requires a label for source variable '{}'",
+                        self.expand_mode, source_variable
                     ),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 });
@@ -77,11 +80,11 @@ impl DataFusionPlanner {
         };
 
         let Some(node_map) = self.config.get_node_mapping(src_label) else {
-            if self.index_policy == crate::index::IndexUsagePolicy::Require {
+            if self.expand_mode != crate::index::ExpandExecutionMode::Join {
                 return Err(crate::error::GraphError::PlanError {
                     message: format!(
-                        "CSR index is required but node mapping '{}' is missing",
-                        src_label
+                        "requested {:?} expand index requires node mapping '{}'",
+                        self.expand_mode, src_label
                     ),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 });
@@ -130,12 +133,16 @@ impl DataFusionPlanner {
             &target_id_type,
             target_reused,
         )?;
-        if let crate::index::IndexDecision::Use(index_ref) = decision {
-            let output_target_column = crate::case_insensitive::qualify_column(
-                &rel_instance.alias,
-                &rel_map.target_id_field,
-            );
-            let indexed = crate::datafusion_planner::indexed_expand::IndexedExpandNode::try_new(
+        if let crate::index::ExpandPlanDecision::Indexed(index_ref) = decision {
+            let target_endpoint_field = match direction {
+                RelationshipDirection::Outgoing | RelationshipDirection::Undirected => {
+                    &rel_map.target_id_field
+                }
+                RelationshipDirection::Incoming => &rel_map.source_id_field,
+            };
+            let output_target_column =
+                crate::case_insensitive::qualify_column(&rel_instance.alias, target_endpoint_field);
+            let indexed = crate::datafusion_planner::indexed_expand::AdjacencyExpandNode::try_new(
                 left_plan,
                 source_column,
                 output_target_column.clone(),
@@ -531,10 +538,10 @@ mod tests {
     }
 
     #[test]
-    fn test_df_planner_prefers_csr_index_when_registered() {
+    fn test_df_planner_requires_the_explicit_csr_backend() {
         use crate::index::{
-            CsrIndexHandle, GraphIndexKey, GraphIndexMetadata, InMemoryGraphIndexRegistry,
-            IndexDirection, IndexUsagePolicy,
+            CsrIndexHandle, ExpandExecutionMode, GraphIndexKey, GraphIndexMetadata,
+            InMemoryGraphIndexRegistry, IndexDirection,
         };
         use arrow_schema::DataType;
         use std::sync::Arc;
@@ -573,11 +580,62 @@ mod tests {
             target_properties: Default::default(),
         };
         let planner = DataFusionPlanner::with_catalog(person_knows_config(), make_catalog())
-            .with_indexes(registry, IndexUsagePolicy::Require);
+            .with_indexes(registry, ExpandExecutionMode::Csr);
         let plan = planner.plan(&expand).unwrap();
         let display = format!("{}", plan.display_indent());
-        assert!(display.contains("IndexedExpand"));
+        assert!(display.contains("AdjacencyExpand"));
         assert!(!display.to_lowercase().contains("table scan: knows"));
+    }
+
+    #[test]
+    fn test_df_planner_does_not_fallback_from_csr_to_join() {
+        use crate::index::{ExpandExecutionMode, InMemoryGraphIndexRegistry};
+        use std::sync::Arc;
+        let expand = LogicalOperator::Expand {
+            input: Box::new(person_scan("a")),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            target_label: "Person".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            properties: Default::default(),
+            target_properties: Default::default(),
+        };
+        let planner = DataFusionPlanner::with_catalog(person_knows_config(), make_catalog())
+            .with_indexes(
+                Arc::new(InMemoryGraphIndexRegistry::new()),
+                ExpandExecutionMode::Csr,
+            );
+        let error = planner.plan(&expand).unwrap_err();
+        assert!(format!("{error}").contains("requested CSR index not found"));
+    }
+
+    #[test]
+    fn test_df_planner_does_not_fallback_from_direct_adjacency_to_csr() {
+        use crate::index::{ExpandExecutionMode, InMemoryGraphIndexRegistry};
+        use std::sync::Arc;
+        let expand = LogicalOperator::Expand {
+            input: Box::new(person_scan("a")),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            target_label: "Person".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            properties: Default::default(),
+            target_properties: Default::default(),
+        };
+        let planner = DataFusionPlanner::with_catalog(person_knows_config(), make_catalog())
+            .with_indexes(
+                Arc::new(InMemoryGraphIndexRegistry::new()),
+                ExpandExecutionMode::direct_adjacency("missing").unwrap(),
+            );
+        let error = planner.plan(&expand).unwrap_err();
+        assert!(
+            format!("{error}").to_lowercase().contains("direct"),
+            "{error}"
+        );
     }
 
     #[test]
