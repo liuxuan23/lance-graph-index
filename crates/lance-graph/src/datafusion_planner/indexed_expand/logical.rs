@@ -152,6 +152,7 @@ impl AdjacencyExpandNode {
         match &self.index_ref {
             ExpandIndexReference::Csr(reference) => &reference.key,
             ExpandIndexReference::DirectAdjacency(reference) => &reference.key,
+            ExpandIndexReference::CoveringAdjacency(reference) => &reference.key,
         }
     }
 }

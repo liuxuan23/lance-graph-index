@@ -108,6 +108,49 @@ impl ExtensionPlanner for IndexedExpandExtensionPlanner {
                     ),
                 )))
             }
+            crate::index::ExpandIndexReference::CoveringAdjacency(reference) => {
+                let handle = self
+                    .indexes
+                    .get_covering_adjacency(&reference.index_name, &reference.key)
+                    .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Plan(format!(
+                            "Covering Adjacency index not found for {:?}",
+                            reference.key
+                        ))
+                    })?;
+                let bundle = self
+                    .indexes
+                    .get_covering_adjacency_bundle(&reference.index_name)
+                    .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Plan(format!(
+                            "Covering Adjacency bundle {:?} not found",
+                            reference.index_name
+                        ))
+                    })?;
+                if bundle.metadata.bundle_generation != reference.bundle_generation
+                    || handle.metadata.generation != reference.component_generation
+                    || handle.metadata.format_version != reference.format_version
+                {
+                    return Err(datafusion::common::DataFusionError::Plan(
+                        "Covering Adjacency index generation changed during planning".into(),
+                    ));
+                }
+                Ok(Some(Arc::new(
+                    super::physical::CoveringAdjacencyExpandExec::try_new(
+                        child.clone(),
+                        handle,
+                        node.source_column(),
+                        field.into(),
+                        node.max_output_batch_rows(),
+                    )?
+                    .with_bundle_identity(
+                        reference.index_name.clone(),
+                        reference.bundle_generation,
+                    ),
+                )))
+            }
         }
     }
 }

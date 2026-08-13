@@ -3,5 +3,5 @@ mod physical;
 mod planner;
 
 pub use logical::AdjacencyExpandNode;
-pub use physical::IndexedExpandExec;
+pub use physical::{CoveringAdjacencyExpandExec, IndexedExpandExec};
 pub use planner::{GraphQueryPlanner, IndexedExpandExtensionPlanner};

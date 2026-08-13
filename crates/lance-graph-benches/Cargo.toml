@@ -58,3 +58,8 @@ harness = false
 name = "multi_type_direct_adjacency"
 path = "benches/indexed_expand/multi_type_direct_adjacency.rs"
 harness = false
+
+[[bench]]
+name = "covering_adjacency"
+path = "benches/indexed_expand/covering_adjacency.rs"
+harness = false

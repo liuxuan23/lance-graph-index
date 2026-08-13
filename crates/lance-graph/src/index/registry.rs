@@ -1,5 +1,6 @@
 use super::metadata::{
-    CsrIndexHandle, DirectAdjacencyIndexHandle, GraphIndexKey, MultiTypeDirectAdjacencyIndexHandle,
+    CoveringAdjacencyIndexHandle, CsrIndexHandle, DirectAdjacencyIndexHandle, GraphIndexKey,
+    MultiTypeCoveringAdjacencyIndexHandle, MultiTypeDirectAdjacencyIndexHandle,
 };
 use crate::error::{GraphError, GraphIndexErrorKind, Result};
 use std::collections::HashMap;
@@ -16,12 +17,22 @@ pub trait GraphIndexRegistry: Send + Sync {
         &self,
         index_name: &str,
     ) -> Result<Option<Arc<MultiTypeDirectAdjacencyIndexHandle>>>;
+    fn get_covering_adjacency(
+        &self,
+        index_name: &str,
+        key: &GraphIndexKey,
+    ) -> Result<Option<Arc<CoveringAdjacencyIndexHandle>>>;
+    fn get_covering_adjacency_bundle(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeCoveringAdjacencyIndexHandle>>>;
 }
 
 #[derive(Debug, Default)]
 pub struct InMemoryGraphIndexRegistry {
     csr_indexes: RwLock<HashMap<GraphIndexKey, Arc<CsrIndexHandle>>>,
     direct_adjacency_indexes: RwLock<HashMap<String, Arc<MultiTypeDirectAdjacencyIndexHandle>>>,
+    covering_adjacency_indexes: RwLock<HashMap<String, Arc<MultiTypeCoveringAdjacencyIndexHandle>>>,
 }
 
 impl InMemoryGraphIndexRegistry {
@@ -145,6 +156,64 @@ impl InMemoryGraphIndexRegistry {
         Ok(())
     }
 
+    pub fn register_covering_adjacency_bundle(
+        &self,
+        handle: MultiTypeCoveringAdjacencyIndexHandle,
+    ) -> Result<()> {
+        validate_covering_adjacency_bundle(&handle)?;
+        let index_name = normalize_index_name(&handle.metadata.index_name)?;
+        let mut indexes =
+            self.covering_adjacency_indexes
+                .write()
+                .map_err(|_| GraphError::PlanError {
+                    message: "covering adjacency registry lock poisoned".into(),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+        if let Some(previous) = indexes.get(&index_name) {
+            if handle.metadata.bundle_generation < previous.metadata.bundle_generation {
+                return Err(GraphError::IndexError {
+                    kind: GraphIndexErrorKind::GenerationConflict,
+                    message: format!(
+                        "covering adjacency bundle generation {} is older than registered generation {} for {}",
+                        handle.metadata.bundle_generation,
+                        previous.metadata.bundle_generation,
+                        index_name
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+            if handle.metadata.bundle_generation == previous.metadata.bundle_generation {
+                if covering_bundle_identity_matches(&handle, previous) {
+                    return Ok(());
+                }
+                return Err(GraphError::IndexError {
+                    kind: GraphIndexErrorKind::GenerationConflict,
+                    message: format!(
+                        "covering adjacency bundle generation {} conflicts with registered bundle {}",
+                        handle.metadata.bundle_generation, index_name
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+        }
+        indexes.insert(index_name, Arc::new(handle));
+        Ok(())
+    }
+
+    pub fn remove_covering_adjacency(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeCoveringAdjacencyIndexHandle>>> {
+        Ok(self
+            .covering_adjacency_indexes
+            .write()
+            .map_err(|_| GraphError::PlanError {
+                message: "covering adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .remove(&normalize_index_name(index_name)?))
+    }
+
     pub fn remove_direct_adjacency(
         &self,
         index_name: &str,
@@ -224,6 +293,60 @@ fn validate_direct_adjacency_bundle(handle: &MultiTypeDirectAdjacencyIndexHandle
     Ok(())
 }
 
+fn validate_covering_adjacency_bundle(
+    handle: &MultiTypeCoveringAdjacencyIndexHandle,
+) -> Result<()> {
+    let index_name = normalize_index_name(&handle.metadata.index_name)?;
+    if index_name != handle.metadata.index_name
+        || handle.components.is_empty()
+        || handle.metadata.num_components != handle.components.len() as u64
+    {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Corrupt,
+            message: "covering adjacency bundle identity or component count is invalid".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    let mut num_sources = 0_u64;
+    let mut num_edges = 0_u64;
+    for (key, component) in &handle.components {
+        if key != &component.metadata.key
+            || component.metadata != *component.index.metadata()
+            || component.metadata.num_sources
+                != component.metadata.num_inline_sources
+                    + component.metadata.num_posting_tree_sources
+        {
+            return Err(GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "covering adjacency component metadata is inconsistent".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+        num_sources = num_sources
+            .checked_add(component.metadata.num_sources)
+            .ok_or_else(|| GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "covering adjacency source count overflow".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+        num_edges = num_edges
+            .checked_add(component.metadata.num_edges)
+            .ok_or_else(|| GraphError::IndexError {
+                kind: GraphIndexErrorKind::Corrupt,
+                message: "covering adjacency edge count overflow".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+    }
+    if num_sources != handle.metadata.num_sources || num_edges != handle.metadata.num_edges {
+        return Err(GraphError::IndexError {
+            kind: GraphIndexErrorKind::Corrupt,
+            message: "covering adjacency bundle aggregate counts mismatch".into(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        });
+    }
+    Ok(())
+}
+
 fn validate_direct_adjacency_handle(handle: &DirectAdjacencyIndexHandle) -> Result<()> {
     if handle.metadata.dataset_version != handle.dataset.version().version {
         return Err(GraphError::IndexError {
@@ -279,6 +402,20 @@ fn bundle_identity_matches(
         })
 }
 
+fn covering_bundle_identity_matches(
+    left: &MultiTypeCoveringAdjacencyIndexHandle,
+    right: &MultiTypeCoveringAdjacencyIndexHandle,
+) -> bool {
+    left.metadata == right.metadata
+        && left.components.len() == right.components.len()
+        && left.components.iter().all(|(key, component)| {
+            right
+                .components
+                .get(key)
+                .is_some_and(|other| component.metadata == other.metadata)
+        })
+}
+
 impl GraphIndexRegistry for InMemoryGraphIndexRegistry {
     fn get_csr(&self, key: &GraphIndexKey) -> Result<Option<Arc<CsrIndexHandle>>> {
         Ok(self
@@ -323,14 +460,48 @@ impl GraphIndexRegistry for InMemoryGraphIndexRegistry {
             .get(&normalize_index_name(index_name)?)
             .cloned())
     }
+
+    fn get_covering_adjacency(
+        &self,
+        index_name: &str,
+        key: &GraphIndexKey,
+    ) -> Result<Option<Arc<CoveringAdjacencyIndexHandle>>> {
+        Ok(self
+            .covering_adjacency_indexes
+            .read()
+            .map_err(|_| GraphError::PlanError {
+                message: "covering adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .get(&normalize_index_name(index_name)?)
+            .and_then(|bundle| bundle.get(key)))
+    }
+
+    fn get_covering_adjacency_bundle(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<Arc<MultiTypeCoveringAdjacencyIndexHandle>>> {
+        Ok(self
+            .covering_adjacency_indexes
+            .read()
+            .map_err(|_| GraphError::PlanError {
+                message: "covering adjacency registry lock poisoned".into(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .get(&normalize_index_name(index_name)?)
+            .cloned())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::{
+        CoveringAdjacencyCompression, CoveringAdjacencyIndexBuilder, CoveringAdjacencyMetadata,
         DirectAdjacencyIndexBuilder, DirectAdjacencyMetadata, GraphIndexKey, GraphIndexMetadata,
-        IndexDirection, MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexStore,
+        IndexDirection, MultiTypeCoveringAdjacencyIndexBuilder,
+        MultiTypeCoveringAdjacencyIndexStore, MultiTypeDirectAdjacencyIndexBuilder,
+        MultiTypeDirectAdjacencyIndexStore,
     };
     use crate::CsrIndexBuilder;
     use arrow_array::{Int64Array, RecordBatch};
@@ -503,6 +674,102 @@ mod tests {
 
         let error = registry
             .register_direct_adjacency_bundle(bundle(directory.path(), "primary", 0, 3).await)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GraphError::IndexError {
+                kind: GraphIndexErrorKind::GenerationConflict,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_covering_bundles_replace_only_with_newer_generations() {
+        async fn bundle(
+            root: &std::path::Path,
+            bundle_generation: u64,
+            component_generation: u64,
+        ) -> MultiTypeCoveringAdjacencyIndexHandle {
+            let component_uri = root.join(format!("covering-component-{bundle_generation}"));
+            let bundle_uri = root.join(format!("covering-bundle-{bundle_generation}"));
+            let edges = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("src_id", DataType::Int64, false),
+                    Field::new("dst_id", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(Int64Array::from(vec![2, 3])),
+                ],
+            )
+            .unwrap();
+            let descriptor = CoveringAdjacencyIndexBuilder::new(CoveringAdjacencyMetadata {
+                key: GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing),
+                source_id_field: "person_id".into(),
+                target_id_field: "person_id".into(),
+                source_id_data_type: DataType::Int64,
+                target_id_data_type: DataType::Int64,
+                num_sources: 0,
+                num_edges: 0,
+                max_degree: 0,
+                generation: component_generation,
+                format_version: crate::COVERING_ADJACENCY_INDEX_FORMAT_VERSION,
+                index_uri: String::new(),
+                entry_directory_uri: String::new(),
+                posting_directory_uri: String::new(),
+                entry_pages_uri: String::new(),
+                posting_pages_uri: String::new(),
+                entry_page_target_bytes: 0,
+                inline_posting_threshold_bytes: 0,
+                posting_page_target_bytes: 0,
+                compression: CoveringAdjacencyCompression::None,
+                num_entry_pages: 0,
+                num_inline_sources: 0,
+                num_posting_tree_sources: 0,
+                num_posting_pages: 0,
+                source_uri: None,
+                source_version: None,
+            })
+            .unwrap()
+            .add_edges_from_batch(&edges)
+            .unwrap()
+            .build_and_persist(component_uri.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+            let descriptor =
+                MultiTypeCoveringAdjacencyIndexBuilder::new("social_covering", bundle_generation)
+                    .unwrap()
+                    .add_component(descriptor)
+                    .unwrap()
+                    .build_and_persist(bundle_uri.to_str().unwrap())
+                    .await
+                    .unwrap();
+            MultiTypeCoveringAdjacencyIndexStore::load(&descriptor, Default::default())
+                .await
+                .unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = InMemoryGraphIndexRegistry::new();
+        registry
+            .register_covering_adjacency_bundle(bundle(directory.path(), 1, 1).await)
+            .unwrap();
+        registry
+            .register_covering_adjacency_bundle(bundle(directory.path(), 2, 2).await)
+            .unwrap();
+        let key = GraphIndexKey::new("KNOWS", "Person", "Person", IndexDirection::Outgoing);
+        assert_eq!(
+            registry
+                .get_covering_adjacency("SOCIAL_COVERING", &key)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .generation,
+            2
+        );
+        let error = registry
+            .register_covering_adjacency_bundle(bundle(directory.path(), 0, 3).await)
             .unwrap_err();
         assert!(matches!(
             error,

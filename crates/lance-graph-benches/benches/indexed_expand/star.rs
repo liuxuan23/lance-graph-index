@@ -20,10 +20,12 @@ use datafusion::execution::context::SessionContext;
 use lance::datafusion::LanceTableProvider;
 use lance::dataset::{Dataset, WriteParams};
 use lance_graph::{
-    CsrIndexBuilder, CsrIndexHandle, CsrIndexStore, CypherQuery, DirectAdjacencyIndexBuilder,
-    DirectAdjacencyMetadata, ExpandExecutionMode, GraphConfig, GraphIndexKey, GraphIndexMetadata,
-    InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection,
-    MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexStore,
+    CoveringAdjacencyIndexBuilder, CoveringAdjacencyMetadata, CsrIndexBuilder, CsrIndexHandle,
+    CsrIndexStore, CypherQuery, DirectAdjacencyIndexBuilder, DirectAdjacencyMetadata,
+    ExpandExecutionMode, GraphConfig, GraphIndexKey, GraphIndexMetadata, InMemoryCatalog,
+    InMemoryGraphIndexRegistry, IndexDirection, MultiTypeCoveringAdjacencyIndexBuilder,
+    MultiTypeCoveringAdjacencyIndexStore, MultiTypeDirectAdjacencyIndexBuilder,
+    MultiTypeDirectAdjacencyIndexStore,
 };
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};
@@ -74,19 +76,20 @@ fn make_star_edges(source_count: usize, edge_count: usize, query_degree: usize) 
     let mut src = Vec::with_capacity(edge_count);
     let mut dst = Vec::with_capacity(edge_count);
 
-    for offset in 1..=query_degree {
-        src.push(QUERY_SOURCE_ID as i64);
-        dst.push(((QUERY_SOURCE_ID + offset) % source_count) as i64);
-    }
-
-    'offsets: for offset in 1usize.. {
-        for source in 0..source_count {
-            if source == QUERY_SOURCE_ID {
-                continue;
-            }
-            if src.len() == edge_count {
-                break 'offsets;
-            }
+    let remaining_edges = edge_count - query_degree;
+    let other_sources = source_count - 1;
+    let base_degree = remaining_edges / other_sources;
+    let extra_sources = remaining_edges % other_sources;
+    let mut non_hub_ordinal = 0_usize;
+    for source in 0..source_count {
+        let degree = if source == QUERY_SOURCE_ID {
+            query_degree
+        } else {
+            let degree = base_degree + usize::from(non_hub_ordinal < extra_sources);
+            non_hub_ordinal += 1;
+            degree
+        };
+        for offset in 1..=degree {
             src.push(source as i64);
             dst.push(((source + offset) % source_count) as i64);
         }
@@ -244,7 +247,7 @@ fn setup_graph(
         dataset_uri: String::new(),
         dataset_version: 0,
         scalar_index_name: "src_id_btree".into(),
-        source_uri: Some(edge_source_uri),
+        source_uri: Some(edge_source_uri.clone()),
         source_version: Some(edge_source_version),
         generation: 1,
     };
@@ -275,6 +278,47 @@ fn setup_graph(
         .unwrap();
     indexes
         .register_direct_adjacency_bundle(direct_handle)
+        .unwrap();
+
+    let covering_uri = data_dir.path().join("covering-generation-1");
+    let covering_descriptor = rt
+        .block_on(
+            CoveringAdjacencyIndexBuilder::new(
+                CoveringAdjacencyMetadata::new(
+                    GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
+                    "person_id",
+                    "person_id",
+                    DataType::Int64,
+                    1,
+                )
+                .with_source_identity(edge_source_uri.clone(), Some(edge_source_version)),
+            )
+            .unwrap()
+            .build_sorted_batch_and_persist(
+                &edges,
+                covering_uri.to_str().unwrap(),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+    let covering_bundle_uri = data_dir.path().join("covering-bundle-generation-1");
+    let covering_bundle_descriptor = rt
+        .block_on(
+            MultiTypeCoveringAdjacencyIndexBuilder::new("star_covering", 1)
+                .unwrap()
+                .add_component(covering_descriptor)
+                .unwrap()
+                .build_and_persist(covering_bundle_uri.to_str().unwrap()),
+        )
+        .unwrap();
+    let covering_handle = rt
+        .block_on(MultiTypeCoveringAdjacencyIndexStore::load(
+            &covering_bundle_descriptor,
+            Default::default(),
+        ))
+        .unwrap();
+    indexes
+        .register_covering_adjacency_bundle(covering_handle)
         .unwrap();
 
     let config = GraphConfig::builder()
@@ -343,6 +387,7 @@ fn assert_indexed_get_v_plan(plan: &str, case_name: &str, mode: &ExpandExecution
         plan.contains(match mode {
             ExpandExecutionMode::Csr => "IndexedExpandExec",
             ExpandExecutionMode::DirectAdjacency { .. } => "DirectAdjacencyExpandExec",
+            ExpandExecutionMode::CoveringAdjacency { .. } => "CoveringAdjacencyExpandExec",
             ExpandExecutionMode::Join => "HashJoinExec",
         }),
         "{case_name} did not use the selected expand backend:\n{plan}"
@@ -365,7 +410,16 @@ fn bench_star_execution(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_execution_star_join_vs_indexed");
     let rt = tokio::runtime::Runtime::new().unwrap();
     let nodes = setup_nodes(&rt, SOURCE_COUNT);
-    for degree in [10usize, 100, 1_000, 10_000] {
+    let degrees = std::env::var("LANCE_GRAPH_STAR_DEGREES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|degree| degree.trim().parse::<usize>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![10usize, 100, 1_000, 10_000]);
+    for degree in degrees {
         let graph = setup_graph(&rt, nodes.table.clone(), SOURCE_COUNT, EDGE_COUNT, degree);
         group.throughput(Throughput::Elements(degree as u64));
 
@@ -378,9 +432,13 @@ fn bench_star_execution(c: &mut Criterion) {
         let direct_mode = ExpandExecutionMode::direct_adjacency("star_adjacency").unwrap();
         let direct_result =
             run_indexed_get_v_query(&rt, &graph, &graph.query_hub, direct_mode.clone());
+        let covering_mode = ExpandExecutionMode::covering_adjacency("star_covering").unwrap();
+        let covering_result =
+            run_indexed_get_v_query(&rt, &graph, &graph.query_hub, covering_mode.clone());
         assert_eq!(join_result.num_rows(), graph.expected_rows);
         assert_eq!(sorted_names(&indexed_result), sorted_names(&join_result));
         assert_eq!(sorted_names(&direct_result), sorted_names(&join_result));
+        assert_eq!(sorted_names(&covering_result), sorted_names(&join_result));
 
         let indexed_plan = rt
             .block_on(graph.query_hub.explain_with_catalog_context_and_indexes(
@@ -400,6 +458,15 @@ fn bench_star_execution(c: &mut Criterion) {
             ))
             .unwrap();
         assert_indexed_get_v_plan(&direct_plan, "direct_adjacency", &direct_mode);
+        let covering_plan = rt
+            .block_on(graph.query_hub.explain_with_catalog_context_and_indexes(
+                graph.catalog.clone(),
+                graph.indexed_context.clone(),
+                graph.indexes.clone(),
+                covering_mode.clone(),
+            ))
+            .unwrap();
+        assert_indexed_get_v_plan(&covering_plan, "covering_adjacency", &covering_mode);
 
         group.bench_with_input(
             BenchmarkId::new(
@@ -408,6 +475,26 @@ fn bench_star_execution(c: &mut Criterion) {
             ),
             &degree,
             |b, _| b.iter(|| black_box(run_join_query(&rt, &graph, &graph.query_hub).num_rows())),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(
+                "covering_adjacency_get_v",
+                format!("sources_{SOURCE_COUNT}_degree_{degree}_edges_{EDGE_COUNT}"),
+            ),
+            &degree,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        run_indexed_get_v_query(
+                            &rt,
+                            &graph,
+                            &graph.query_hub,
+                            covering_mode.clone(),
+                        )
+                        .num_rows(),
+                    )
+                })
+            },
         );
         group.bench_with_input(
             BenchmarkId::new(

@@ -18,9 +18,11 @@ use lance::datafusion::LanceTableProvider;
 use lance::dataset::{Dataset, WriteParams};
 use lance_graph::datafusion_planner::get_v::LanceGetVByIdExec;
 use lance_graph::{
-    CsrIndexBuilder, CsrIndexHandle, CypherQuery, DirectAdjacencyIndexBuilder,
-    DirectAdjacencyMetadata, ExpandExecutionMode, GraphConfig, GraphIndexKey, GraphIndexMetadata,
-    InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection,
+    CoveringAdjacencyCompression, CoveringAdjacencyIndexBuilder, CoveringAdjacencyMetadata,
+    CoveringAdjacencyWriteOptions, CsrIndexBuilder, CsrIndexHandle, CypherQuery,
+    DirectAdjacencyIndexBuilder, DirectAdjacencyMetadata, ExpandExecutionMode, GraphConfig,
+    GraphIndexKey, GraphIndexMetadata, InMemoryCatalog, InMemoryGraphIndexRegistry, IndexDirection,
+    MultiTypeCoveringAdjacencyIndexBuilder, MultiTypeCoveringAdjacencyIndexStore,
     MultiTypeDirectAdjacencyIndexBuilder, MultiTypeDirectAdjacencyIndexStore,
 };
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -792,6 +794,257 @@ async fn direct_adjacency_getv_matches_join_and_uses_only_the_selected_backend()
         .await
         .unwrap_err();
     assert!(format!("{error}").contains("blocks"), "{error}");
+}
+
+#[tokio::test]
+async fn covering_adjacency_getv_matches_join_and_is_index_only_on_adjacency_side() {
+    let (_temp, graph) = lance_graph(true).await;
+    let component_uri = _temp.path().join("covering-generation-1");
+    let descriptor = CoveringAdjacencyIndexBuilder::new(CoveringAdjacencyMetadata {
+        key: GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
+        source_id_field: "person_id".into(),
+        target_id_field: "person_id".into(),
+        source_id_data_type: DataType::Int64,
+        target_id_data_type: DataType::Int64,
+        num_sources: 0,
+        num_edges: 0,
+        max_degree: 0,
+        generation: 3,
+        format_version: lance_graph::COVERING_ADJACENCY_INDEX_FORMAT_VERSION,
+        index_uri: String::new(),
+        entry_directory_uri: String::new(),
+        posting_directory_uri: String::new(),
+        entry_pages_uri: String::new(),
+        posting_pages_uri: String::new(),
+        entry_page_target_bytes: 0,
+        inline_posting_threshold_bytes: 0,
+        posting_page_target_bytes: 0,
+        compression: CoveringAdjacencyCompression::None,
+        num_entry_pages: 0,
+        num_inline_sources: 0,
+        num_posting_tree_sources: 0,
+        num_posting_pages: 0,
+        source_uri: None,
+        source_version: None,
+    })
+    .unwrap()
+    .add_edges_from_batch(&edge_batch())
+    .unwrap()
+    .build_and_persist(
+        component_uri.to_str().unwrap(),
+        CoveringAdjacencyWriteOptions {
+            entry_page_target_bytes: 128,
+            inline_posting_threshold_bytes: 32,
+            posting_page_target_bytes: 64,
+        },
+    )
+    .await
+    .unwrap();
+    let bundle_uri = _temp.path().join("covering-bundle-generation-1");
+    let bundle = MultiTypeCoveringAdjacencyIndexBuilder::new("social_covering", 4)
+        .unwrap()
+        .add_component(descriptor)
+        .unwrap()
+        .build_and_persist(bundle_uri.to_str().unwrap())
+        .await
+        .unwrap();
+    let handle = MultiTypeCoveringAdjacencyIndexStore::load(&bundle, Default::default())
+        .await
+        .unwrap();
+    graph
+        .indexes
+        .register_covering_adjacency_bundle(handle)
+        .unwrap();
+
+    let baseline = graph
+        .query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let mode = ExpandExecutionMode::covering_adjacency("social_covering").unwrap();
+    let explain = graph
+        .query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            mode.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(explain.contains("CoveringAdjacencyExpandExec"), "{explain}");
+    assert!(explain.contains("layout=gin_style"), "{explain}");
+    assert!(explain.contains("index_name=social_covering"), "{explain}");
+    assert!(explain.contains("LanceGetVByIdExec"), "{explain}");
+    assert!(!explain.contains("DirectAdjacencyExpandExec"), "{explain}");
+    assert!(!explain.contains("IndexedExpandExec"), "{explain}");
+    assert!(!explain.contains("HashJoinExec"), "{explain}");
+    assert!(
+        !explain.to_lowercase().contains("tablescan: friend_of"),
+        "{explain}"
+    );
+
+    let covering = graph
+        .query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            mode,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_as_multiset(&covering), rows_as_multiset(&baseline));
+
+    let missing = graph
+        .query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog,
+            graph.context,
+            graph.indexes,
+            ExpandExecutionMode::covering_adjacency("missing_covering").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{missing}").contains("missing_covering"));
+}
+
+#[tokio::test]
+async fn covering_bundle_selects_incoming_and_cross_label_components() {
+    let (_temp, graph) = lance_graph(true).await;
+    async fn component(
+        uri: &std::path::Path,
+        key: GraphIndexKey,
+        source_id_field: &str,
+        target_id_field: &str,
+        edges: &RecordBatch,
+    ) -> lance_graph::PersistedCoveringAdjacencyDescriptor {
+        CoveringAdjacencyIndexBuilder::new(CoveringAdjacencyMetadata::new(
+            key,
+            source_id_field,
+            target_id_field,
+            DataType::Int64,
+            1,
+        ))
+        .unwrap()
+        .add_edges_from_batch(edges)
+        .unwrap()
+        .build_and_persist(uri.to_str().unwrap(), Default::default())
+        .await
+        .unwrap()
+    }
+    let outgoing = component(
+        &_temp.path().join("covering-outgoing"),
+        GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Outgoing),
+        "person_id",
+        "person_id",
+        &edge_batch(),
+    )
+    .await;
+    let incoming = component(
+        &_temp.path().join("covering-incoming"),
+        GraphIndexKey::new("FRIEND_OF", "Person", "Person", IndexDirection::Incoming),
+        "person_id",
+        "person_id",
+        &reversed_edge_batch(),
+    )
+    .await;
+    let works_at = component(
+        &_temp.path().join("covering-works-at"),
+        GraphIndexKey::new("WORKS_AT", "Person", "Company", IndexDirection::Outgoing),
+        "person_id",
+        "company_id",
+        &works_at_batch(),
+    )
+    .await;
+    let bundle = MultiTypeCoveringAdjacencyIndexBuilder::new("graph_covering", 1)
+        .unwrap()
+        .add_component(outgoing)
+        .unwrap()
+        .add_component(incoming)
+        .unwrap()
+        .add_component(works_at)
+        .unwrap()
+        .build_and_persist(_temp.path().join("covering-bundle").to_str().unwrap())
+        .await
+        .unwrap();
+    graph
+        .indexes
+        .register_covering_adjacency_bundle(
+            MultiTypeCoveringAdjacencyIndexStore::load(&bundle, Default::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+    let incoming_query = CypherQuery::new(
+        "MATCH (b:Person)<-[:FRIEND_OF]-(a:Person) \
+         RETURN b.person_id, b.name, a.person_id, a.name",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let incoming_baseline = incoming_query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let incoming_explain = incoming_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::covering_adjacency("graph_covering").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(incoming_explain.contains("direction=Incoming"));
+    let incoming_result = incoming_query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::covering_adjacency("graph_covering").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_as_multiset(&incoming_result),
+        rows_as_multiset(&incoming_baseline)
+    );
+
+    let cross_label_query = CypherQuery::new(
+        "MATCH (a:Person)-[:WORKS_AT]->(c:Company) \
+         RETURN a.person_id, c.company_id",
+    )
+    .unwrap()
+    .with_config(graph_config());
+    let cross_label_baseline = cross_label_query
+        .execute_with_catalog_and_context(graph.catalog.clone(), graph.context.clone())
+        .await
+        .unwrap();
+    let cross_label_explain = cross_label_query
+        .explain_with_catalog_context_and_indexes(
+            graph.catalog.clone(),
+            graph.context.clone(),
+            graph.indexes.clone(),
+            ExpandExecutionMode::covering_adjacency("graph_covering").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cross_label_explain.contains("target_label=company"));
+    assert!(cross_label_explain.contains("LanceGetVByIdExec"));
+    let cross_label_result = cross_label_query
+        .execute_with_catalog_context_and_indexes(
+            graph.catalog,
+            graph.context,
+            graph.indexes,
+            ExpandExecutionMode::covering_adjacency("graph_covering").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        id_pairs(&cross_label_result),
+        id_pairs(&cross_label_baseline)
+    );
 }
 
 #[tokio::test]

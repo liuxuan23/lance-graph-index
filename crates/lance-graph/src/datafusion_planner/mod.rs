@@ -114,6 +114,7 @@ impl DataFusionPlanner {
         &self.expand_mode
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn select_expand_index(
         &self,
         relationship_types: &[String],
@@ -227,6 +228,34 @@ impl DataFusionPlanner {
                 }
                 Ok(ExpandPlanDecision::Indexed(
                     ExpandIndexReference::DirectAdjacency(
+                        handle.reference(index_name, bundle.metadata.bundle_generation),
+                    ),
+                ))
+            }
+            ExpandExecutionMode::CoveringAdjacency { index_name } => {
+                let bundle = registry
+                    .get_covering_adjacency_bundle(index_name)?
+                    .ok_or_else(|| crate::error::GraphError::PlanError {
+                        message: format!(
+                            "requested Covering Adjacency bundle {index_name:?} is not registered"
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+                let handle = registry
+                    .get_covering_adjacency(index_name, &key)?
+                    .ok_or_else(|| crate::error::GraphError::PlanError {
+                        message: format!(
+                            "requested Covering Adjacency component not found in bundle {index_name:?} for {key:?}"
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+                if handle.metadata.source_id_data_type != *source_id_type
+                    || handle.metadata.target_id_data_type != *target_id_type
+                {
+                    return invalid("Covering Adjacency metadata ID type mismatch");
+                }
+                Ok(ExpandPlanDecision::Indexed(
+                    ExpandIndexReference::CoveringAdjacency(
                         handle.reference(index_name, bundle.metadata.bundle_generation),
                     ),
                 ))
