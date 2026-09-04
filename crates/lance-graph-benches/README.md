@@ -22,11 +22,21 @@ cargo bench -p lance-graph-benches --bench graph_index_build
 # Run the star-topology Join vs CSR indexed benchmark
 cargo bench -p lance-graph-benches --bench indexed_expand_star
 
+# Run exact-depth Join vs CSR traversal benchmarks
+cargo bench -p lance-graph-benches --bench indexed_expand_depth
+
+# Run the full motivation matrix (scale, frontier, and ordinary edge BTree)
+cargo bench -p lance-graph-benches --bench graph_index_motivation
+
 # Run persisted CSR write, warm-load, and local cold-load benchmarks
 cargo bench -p lance-graph-benches --bench persisted_csr_index
 
 # Run multi-type Direct Adjacency bundle load and component-selection benchmarks
 cargo bench -p lance-graph-benches --bench multi_type_direct_adjacency
+
+# Run the prepared LDBC SNB SF1 Person/KNOWS workload
+LDBC_SNB_ROOT=/data/ldbc-snb-prepared/sf1 \
+  cargo bench -p lance-graph-benches --bench ldbc_snb_workload
 ```
 
 ## Benchmarks
@@ -41,8 +51,14 @@ benches/indexed_expand/
   graph_index_build.rs
   persisted_index.rs
   star.rs
+  depth.rs
+  motivation.rs
   direct_adjacency.rs
   multi_type_direct_adjacency.rs
+benches/ldbc_snb/
+  workload.rs
+  common/
+  scripts/
 ```
 
 - **graph_execution**: End-to-end query execution benchmarks
@@ -62,6 +78,30 @@ benches/indexed_expand/
   `100`, `1,000`, and `10,000`; total edge count remains fixed. Each indexed case explicitly
   selects its `ExpandExecutionMode`, and setup builds/persists/loads both index forms outside
   query timing.
+- **indexed_expand_depth**: Exact-depth traversal from one fixed source over a
+  fixed-size Lance relationship table. Fanout `1` keeps result cardinality at
+  one and isolates repeated self-Join/table-scan cost as depth rises. Fanout
+  `4` also measures frontier growth. The benchmark prints the modeled
+  relationship-row count if every Join hop fully scans the relationship table,
+  plus the neighbor-visit count for CSR. Use
+  `LANCE_GRAPH_DEPTH_SOURCES`, `LANCE_GRAPH_DEPTH_FANOUTS`, and
+  `LANCE_GRAPH_DEPTHS` to override the default `100000`, `1,4`, and
+  `1,2,3,4,5` workloads.
+- **graph_index_motivation**: Completes the motivation matrix with three
+  controlled groups. `graph_execution_relationship_scale` keeps depth `3`,
+  fanout `1`, and output at one row while scaling the relationship table from
+  1K to 100K edges; it reports Join without an edge index, Join with an
+  ordinary edge `src_id` BTree, and CSR + GetV. `graph_execution_start_frontier`
+  fixes graph size and varies the starting frontier with the same three paths.
+  `adjacency_access_scan_vs_scalar_vs_csr`
+  isolates relationship access and compares a repeated full Lance edge scan,
+  an ordinary `src_id` BTree over edge rows followed by `take_rows`, and CSR.
+  `adjacency_access_high_degree` fixes total edge count and changes only one
+  hub's out-degree, using the same three access paths.
+  Environment variables prefixed with `LANCE_GRAPH_SCALE_`,
+  `LANCE_GRAPH_FRONTIER_`, and `LANCE_GRAPH_ACCESS_` override each group.
+  `LANCE_GRAPH_DEGREE_SOURCES`, `LANCE_GRAPH_DEGREE_EDGES`, and
+  `LANCE_GRAPH_DEGREES` control the high-degree group.
 - **persisted_csr_index**: Separately measures immutable CSR generation writes,
   warm loads, and Linux local page-cache cold loads from `offsets.lance`,
   `neighbors.lance`, and `manifest.json`. CSR construction is outside all
@@ -79,6 +119,12 @@ benches/indexed_expand/
   bundles with 1, 3, 10, and 50 components. Extra components after the first three contain one
   edge; the component-count load cases use one edge for every component so they isolate
   descriptor/Dataset/scalar-index open overhead without rebuilding the 10M-edge query workload.
+- **ldbc_snb_workload**: Opens prepared LDBC SNB SF1 `Person` and bidirectionally materialized
+  `KNOWS` Lance datasets, loads or builds CSR, Direct Adjacency, and Covering Adjacency indexes,
+  verifies every indexed result and physical plan against Join, then records per-seed warm-query
+  samples for one-, two-, distinct-two-, and bounded three-hop workloads. See
+  `docs/ldbc-snb-sf1-benchmark-plan.md` and `benches/ldbc_snb/README.md` for data preparation and
+  environment variables.
 
 ## Note
 

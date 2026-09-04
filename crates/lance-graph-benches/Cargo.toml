@@ -12,10 +12,14 @@ lance = "1.0.0"
 lance-index = "1.0.0"
 arrow-array = "56.2"
 arrow-schema = "56.2"
+arrow-select = "56.2"
 criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
+csv = "1"
 datafusion = { version = "50.3", default-features = false, features = ["parquet"] }
 libc = "0.2"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
 
@@ -37,6 +41,16 @@ harness = false
 [[bench]]
 name = "indexed_expand_star"
 path = "benches/indexed_expand/star.rs"
+harness = false
+
+[[bench]]
+name = "indexed_expand_depth"
+path = "benches/indexed_expand/depth.rs"
+harness = false
+
+[[bench]]
+name = "graph_index_motivation"
+path = "benches/indexed_expand/motivation.rs"
 harness = false
 
 [[bench]]
@@ -62,4 +76,9 @@ harness = false
 [[bench]]
 name = "covering_adjacency"
 path = "benches/indexed_expand/covering_adjacency.rs"
+harness = false
+
+[[bench]]
+name = "ldbc_snb_workload"
+path = "benches/ldbc_snb/workload.rs"
 harness = false

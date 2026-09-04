@@ -4091,14 +4091,18 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "criterion",
+ "csv",
  "datafusion",
  "futures",
  "lance",
  "lance-graph",
  "lance-index",
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
